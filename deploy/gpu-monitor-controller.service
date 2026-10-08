@@ -1,0 +1,19 @@
+[Unit]
+Description=GPU Monitor shared controller and inference gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gpu-monitor
+WorkingDirectory=/opt/gpu-monitor
+ExecStart=/usr/bin/node /opt/gpu-monitor/backend/cli.mjs controller --config /etc/gpu-monitor/controller.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

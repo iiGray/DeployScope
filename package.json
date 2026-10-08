@@ -1,0 +1,17 @@
+{
+  "name": "gpu-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local console for shared GPU inference services",
+  "scripts": {
+    "start": "node server.mjs",
+    "init": "node backend/cli.mjs init",
+    "dev": "node backend/cli.mjs dev",
+    "agent": "node backend/cli.mjs agent",
+    "controller": "node backend/cli.mjs controller",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

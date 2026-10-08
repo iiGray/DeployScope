@@ -1,0 +1,20 @@
+[Unit]
+Description=GPU Monitor node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gpu-monitor
+WorkingDirectory=/opt/gpu-monitor
+ExecStart=/usr/bin/node /opt/gpu-monitor/backend/cli.mjs agent --config /etc/gpu-monitor/agent.json
+Environment=PATH=/opt/vllm-venv/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
