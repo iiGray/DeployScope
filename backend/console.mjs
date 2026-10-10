@@ -6,7 +6,7 @@ import { ApiError, readJson, writeJson, serialQueue, httpUrl, bodyJson, json, fa
 import { createSessions } from './sessions.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const assets = new Set(['/index.html', '/favicon.svg', '/src/app.mjs', '/src/app-state.mjs', '/src/model-browser.mjs', '/src/command.mjs', '/src/styles.css', '/src/api.mjs']);
+const assets = new Set(['/index.html', '/favicon.svg', '/src/app.mjs', '/src/app-state.mjs', '/src/model-browser.mjs', '/src/command.mjs', '/src/styles.css', '/src/api.mjs', '/src/shared-session.mjs', '/src/mutation.mjs']);
 const types = { '.html': 'text/html', '.css': 'text/css', '.mjs': 'text/javascript', '.svg': 'image/svg+xml' };
 
 export async function createConsole(config) {

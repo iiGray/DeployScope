@@ -1,13 +1,14 @@
 export const emptyState = () => ({ nodes: [], deployments: [], gateway: { baseUrl: '未连接控制节点' } });
-export const sharedState = ({ nodes, services, apiBase }) => ({ nodes, deployments: services, gateway: { baseUrl: apiBase } });
+export const sharedState = ({ nodes, services, apiBase, inferenceMode }) => ({ nodes, deployments: services, inferenceMode, gateway: { baseUrl: apiBase } });
+export class ApiRequestError extends Error { constructor(message, status = 0) { super(message); this.status = status; } }
 export function createApi(baseUrl = '') {
   return async (path, { method = 'GET', body } = {}) => {
     let response;
     try { response = await fetch(baseUrl + path, { method, headers: { 'X-GPU-Console': '1', ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', signal: AbortSignal.timeout(65000) }); }
-    catch { throw new Error('本地服务连接失败或请求超时，请检查服务是否运行'); }
+    catch { throw new ApiRequestError('网页服务连接失败或请求超时，请检查服务是否运行'); }
     let result;
-    try { result = await response.json(); } catch { throw new Error('后台返回了无效响应'); }
-    if (!response.ok) throw new Error(result.error?.message || `请求失败 (${response.status})`);
+    try { result = await response.json(); } catch { throw new ApiRequestError('后台返回了无效响应', response.status); }
+    if (!response.ok) throw new ApiRequestError(result.error?.message || `请求失败 (${response.status})`, response.status);
     return result;
   };
 }
@@ -26,7 +27,7 @@ export async function readRuntime(client, selectedId, nodeId) {
   let logs = null; let logError = null;
   if (selectedId) {
     try { logs = (await client(`/api/control/deployments/${selectedId}/logs`)).logs; }
-    catch (cause) { logError = cause.message; }
+    catch (cause) { if (cause.status === 401) throw cause; logError = cause.message; }
   }
   return { snapshot, selectedId, logs, logError };
 }

@@ -1,10 +1,18 @@
-import { createInitialState, createDeployment, updateDeployment, startDeployment, stopDeployment, deleteDeployment, validateDraft, renderLogOptions, renderModelIssue, renderDeleteButton, renderDeleteDialog, renderAliasCopyButton, escapeHtml as esc } from './app-state.mjs';
+import { createInitialState, createDeployment, updateDeployment, startDeployment, stopDeployment, deleteDeployment, validateDraft, renderLogOptions, renderModelIssue, renderDeleteButton, renderDeleteDialog, renderAliasCopyButton, renderLocalApi, escapeHtml as esc } from './app-state.mjs';
 import { buildCommand } from './command.mjs';
-import { api, emptyState, sharedState, readRuntime, selectLogService } from './api.mjs';
+import { api as requestApi, emptyState, sharedState, readRuntime, selectLogService } from './api.mjs';
 import { DEFAULT_MODEL_ROOT, createDirectoryReader, renderDirectoryDialog, renderModelOptions } from './model-browser.mjs';
+import { createSessionEpoch, renderLogin } from './shared-session.mjs';
+import { createMutationIntent, mutationBody } from './mutation.mjs';
 
 const STORE = 'gpu-monitor-preview-v1';
 const demo = new URLSearchParams(location.search).get('demo') === '1';
+const epoch = createSessionEpoch();
+let session = { mode: 'local', authenticated: demo, ready: demo };
+let loginMessage = '';
+let editingRevision = null;
+let confirmationIntent = null;
+let retryIntent = null;
 let state = emptyState();
 if (demo) {
   try { state = JSON.parse(localStorage.getItem(STORE)) || createInitialState(); } catch { state = createInitialState(); }
@@ -46,6 +54,61 @@ const directoryReader = createDirectoryReader(async (path, options) => {
   return { root:'/', path:requested, parent:requested==='/' ? null : parentOf(requested), children:[...directories].filter(p => p!=='/' && parentOf(p)===requested).sort().map(p => ({name:p.split('/').at(-1),path:p})) };
 });
 let logs = [{ time: 'READY', message: '选择机器并连接，查看 GPU 状态。', type: 'muted' }];
+
+const shared = () => session.mode === 'shared';
+async function api(path, options) {
+  const captured = epoch.current();
+  try {
+    const result = await requestApi(path, options);
+    if (!epoch.isCurrent(captured)) throw new Error('会话已变化');
+    return result;
+  } catch (cause) {
+    if (epoch.isCurrent(captured) && shared() && cause.status === 401) resetSession(false, '会话已失效，请重新登录');
+    throw cause;
+  }
+}
+function resetSession(authenticated, message = '') {
+  epoch.advance(); directoryReader.cancel();
+  session = { ...session, authenticated, ready: true }; loginMessage = message;
+  state = emptyState(); machineId = ''; connectedId = null; selectedId = null; editingId = null; editingRevision = null;
+  directorySnapshot = null; directoryPicker = null; directoryLoading = false; directoryIssue = ''; confirmationIntent = null; retryIntent = null;
+  rawLog = ''; lastRawLog = ''; runtimeLogError = ''; controlError = ''; error = ''; logs = []; busy = false; connecting = false; polling = false;
+  rootDraft = DEFAULT_MODEL_ROOT; draft = newDraft();
+  document.querySelector('#modal-root').replaceChildren(); document.querySelector('#toast-root').replaceChildren(); render();
+}
+async function login() {
+  const field = document.querySelector('#team-password'); const password = field.value; field.value = '';
+  const captured = epoch.advance(); document.querySelector('#team-login button').disabled = true;
+  try {
+    await requestApi('/api/session/login', { method: 'POST', body: { password } });
+    if (!epoch.isCurrent(captured)) return;
+    resetSession(true);
+    const loggedIn = epoch.current();
+    try { await pullState(true); await poll(); }
+    catch (cause) { if (epoch.isCurrent(loggedIn)) { controlError = cause.message; error = cause.message; render(); } }
+  } catch (cause) { if (epoch.isCurrent(captured)) { loginMessage = cause.message; render(); } }
+}
+async function logout() {
+  const pending = requestApi('/api/session/logout', { method: 'POST', body: {} });
+  resetSession(false, '已退出团队管理网页');
+  const captured = epoch.current();
+  try { await pending; } catch (cause) { if (epoch.isCurrent(captured)) { loginMessage = `服务器尚未确认退出：${cause.message}`; render(); } }
+}
+function intent(kind, item = null, payload = {}) { return createMutationIntent({ kind, id: item?.id || null, payload, revision: kind === 'update' ? editingRevision : item?.revision, shared: shared() }); }
+async function runIntent(frozen, onSuccess) {
+  const captured = epoch.current();
+  const ok = await perform(async () => {
+    const path = frozen.kind === 'create' ? '/api/control/deployments' : `/api/control/deployments/${frozen.id}${['start', 'stop'].includes(frozen.kind) ? '/' + frozen.kind : ''}`;
+    const method = frozen.kind === 'delete' ? 'DELETE' : frozen.kind === 'update' ? 'PATCH' : 'POST';
+    try { const result = await api(path, { method, body: mutationBody(frozen) }); retryIntent = null; await onSuccess(result); }
+    catch (cause) { if (epoch.isCurrent(captured)) retryIntent = frozen.shared && (!cause.status || cause.status >= 500) ? { frozen, onSuccess } : null; throw cause; }
+  });
+  return epoch.isCurrent(captured) && ok;
+}
+function apiHeader() {
+  if (state.inferenceMode === 'per-node') return '<span>本机推理 API · 仅在部署服务器调用</span>';
+  return `<span>统一 API</span><code>${esc(state.gateway.baseUrl || '')}</code><button class="icon-button" data-action="copy-api" aria-label="复制统一 API 地址">${icon('copy')}</button>`;
+}
 
 const paths = {
   gpu: '<rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3M19 9h3m-3 6h3"/>',
@@ -113,7 +176,7 @@ function serviceRows() {
     const machine = state.nodes.find((candidate) => candidate.id === item.nodeId);
     const restartable = ['stopped', 'failed', 'unknown'].includes(item.status);
     const blocked = busy || item.deletePending;
-    return `<tr class="${selectedId === item.id ? 'selected-row' : ''}"><td><div class="service-name-line"><button class="service-name" data-select="${esc(item.id)}" title="选中服务查看日志">${esc(item.alias)}</button>${renderAliasCopyButton(item)}</div><small>${esc(item.modelPath.split('/').at(-1))}</small></td><td title="${esc(item.error || '')}">${status(item.status)}</td><td><span>${esc(machine?.name || '未知机器')}</span><small>GPU ${item.gpuIds.join(', ')} · TP ${item.tensorParallelSize}</small></td><td class="service-actions"><button class="tiny-button" data-edit="${esc(item.id)}" ${blocked ? 'disabled' : ''}>${icon('edit')}修改</button><button class="tiny-button ${restartable ? '' : 'stop-text'}" data-${restartable ? 'start' : 'stop'}="${esc(item.id)}" ${blocked ? 'disabled' : ''}>${icon(restartable ? 'play' : 'stop')}${restartable ? '启动' : '停止'}</button>${renderDeleteButton(item, busy)}</td></tr>`;
+    return `<tr class="${selectedId === item.id ? 'selected-row' : ''}"><td><div class="service-name-line"><button class="service-name" data-select="${esc(item.id)}" title="选中服务查看日志">${esc(item.alias)}</button>${renderAliasCopyButton(item)}</div><small>${esc(item.modelPath.split('/').at(-1))}</small></td><td title="${esc(item.error || '')}">${status(item.status)}</td><td><span>${esc(machine?.name || '未知机器')}${state.inferenceMode === 'per-node' ? ` · GPU ${item.gpuIds.join(', ')} · TP ${item.tensorParallelSize}` : ''}</span>${state.inferenceMode === 'per-node' ? renderLocalApi(item, machine) : `<small>GPU ${item.gpuIds.join(', ')} · TP ${item.tensorParallelSize}</small>`}</td><td class="service-actions"><button class="tiny-button" data-edit="${esc(item.id)}" ${blocked ? 'disabled' : ''}>${icon('edit')}修改</button><button class="tiny-button ${restartable ? '' : 'stop-text'}" data-${restartable ? 'start' : 'stop'}="${esc(item.id)}" ${blocked ? 'disabled' : ''}>${icon(restartable ? 'play' : 'stop')}${restartable ? '启动' : '停止'}</button>${renderDeleteButton(item, busy)}</td></tr>`;
   }).join('');
 }
 
@@ -127,6 +190,7 @@ function selectService(id, view = activeView) {
 }
 
 function render() {
+  if (!session.ready || (shared() && !session.authenticated)) { document.querySelector('#app').innerHTML = session.ready ? renderLogin(loginMessage) : '<main class="login-page">正在连接 DeployScope…</main>'; return; }
   const machine = node();
   const selected = deployment(selectedId);
   document.querySelector('#app').innerHTML = `<main class="console" data-view="${activeView}">
@@ -150,6 +214,10 @@ function render() {
     <footer><span id="control-status"><i class="demo-dot"></i>${demo ? '机器连接、显卡指标与部署日志均为模拟数据。' : esc(controlError || '本地客户端 · 部署状态由共享控制节点同步')}</span><span>vLLM · GPU 独占 · 紧凑 v2</span></footer>
   </main>`;
   document.title = 'GPU Monitor · 推理部署';
+  document.querySelector('.api-inline').innerHTML = apiHeader();
+  if (shared()) document.querySelector('.header-tools').insertAdjacentHTML('beforeend', '<button class="text-button" data-action="logout">退出</button>');
+  if (retryIntent) document.querySelector('#error-box').insertAdjacentHTML('beforeend', '<button class="text-button" data-action="retry-mutation">重试原提交</button>');
+  if (shared()) document.querySelector('#control-status').textContent = controlError || '团队共享管理 · 草稿独立 · 先提交先占用';
   document.querySelector('.model-panel').insertAdjacentHTML('beforeend', `<div class="model-notice">${renderModelIssue(directoryIssue)}</div>`);
   document.querySelector('.command-panel')?.addEventListener('toggle', (event) => { commandOpen = event.target.open; });
   const terminal = document.querySelector('.terminal');
@@ -172,8 +240,8 @@ function updateRuntime() {
   const count = document.querySelector('.gpu-status-panel .section-meta'); if (count) count.textContent = `${node().gpus.length} 张`;
   document.querySelector('.services-table tbody').innerHTML = serviceRows();
   document.querySelector('.services-panel .section-meta').textContent = `${state.deployments.length} 个`;
-  document.querySelector('.api-inline code').textContent = state.gateway.baseUrl;
-  document.querySelector('#control-status').textContent = controlError || '本地客户端 · 部署状态由共享控制节点同步';
+  document.querySelector('.api-inline').innerHTML = apiHeader();
+  document.querySelector('#control-status').textContent = controlError || (shared() ? '团队共享管理 · 草稿独立 · 先提交先占用' : '本地客户端 · 部署状态由共享控制节点同步');
   const connection = document.querySelector('.connection-state');
   connection.classList.toggle('online', connected()); connection.innerHTML = `<i></i>${connected() ? '已连接' : '未连接'}`;
   document.querySelector('[data-action="deploy"]').disabled = !connected() || connecting || busy || directoryLoading || !!node().gpuError || !node().gpus.length || !!deployment(editingId)?.deletePending;
@@ -189,8 +257,11 @@ function updateRuntime() {
   document.querySelector('.model-notice').innerHTML = renderModelIssue(directoryIssue);
 }
 async function pullState(full = false, snapshot = null) {
+  const captured = epoch.current();
+  const received = snapshot || await api('/api/control/state');
+  if (!epoch.isCurrent(captured)) return false;
   const previousIds = state.nodes.map((n) => n.id).join(',');
-  state = sharedState(snapshot || await api('/api/control/state')); controlError = '';
+  state = sharedState(received); controlError = '';
   if (!state.nodes.some((n) => n.id === machineId)) {
     machineId = state.nodes[0]?.id || ''; connectedId = null; resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT; draft = newDraft(); full = true;
   }
@@ -200,12 +271,14 @@ async function pullState(full = false, snapshot = null) {
   if (full) render(); else updateRuntime();
 }
 async function poll() {
-  if (demo || busy || polling || document.hidden) return;
+  if (demo || !session.ready || !session.authenticated || busy || polling || document.hidden) return;
+  const captured = epoch.current();
   polling = true;
   try {
     const id = selectedId;
     const target = machineId;
     const result = await readRuntime(api, id, target || undefined);
+    if (!epoch.isCurrent(captured)) return;
     const selectionUnchanged = selectedId === id && machineId === target;
     await pullState(false, result.snapshot);
     if (selectionUnchanged && selectedId === result.selectedId) {
@@ -215,41 +288,54 @@ async function poll() {
       updateRuntime();
     }
   } catch (cause) {
+    if (!epoch.isCurrent(captured)) return;
     controlError = cause.message;
     for (const n of state.nodes) { n.status = 'offline'; n.gpus = []; }
     for (const s of state.deployments) s.status = 'unknown';
     updateRuntime();
-  } finally { polling = false; }
+  } finally { if (epoch.isCurrent(captured)) polling = false; }
 }
 async function perform(work) {
   if (busy) return false;
+  const captured = epoch.current();
   busy = true; error = ''; render();
-  try { await work(); await pullState(); return true; }
-  catch (cause) { error = cause.message; log(cause.message, 'muted'); await pullState().catch(() => {}); return false; }
-  finally { busy = false; render(); }
+  try { await work(); if (!epoch.isCurrent(captured)) return false; await pullState(); return true; }
+  catch (cause) { if (!epoch.isCurrent(captured)) return false; error = cause.message; log(cause.message, 'muted'); await pullState().catch(() => {}); return false; }
+  finally { if (epoch.isCurrent(captured)) { busy = false; render(); } }
 }
 async function showSettings() {
+  const captured = epoch.current();
   let settings;
-  try { settings = await api('/api/local/settings'); } catch (cause) { notify(cause.message); return; }
+  try { settings = await api('/api/local/settings'); } catch (cause) { if (epoch.isCurrent(captured)) notify(cause.message); return; }
   document.querySelector('#modal-root').innerHTML = `<div class="dialog-backdrop"><section class="confirm-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><h2 id="settings-title">连接设置</h2><p>每位用户连接同一个控制节点，共享机器和部署。</p><label>控制节点地址<input id="controller-url" value="${esc(settings.controllerUrl)}" placeholder="http://控制节点IP:8080" aria-label="控制节点地址"/></label><label>管理密钥<input id="admin-token" type="password" autocomplete="off" placeholder="${settings.configured ? '已保存，留空保持不变' : '控制节点 adminToken'}" aria-label="管理密钥"/></label><div class="settings-actions"><button class="button primary" data-action="save-settings">保存并连接</button></div><details><summary>添加 / 更新机器</summary><label>机器名称<input id="agent-name" placeholder="例如 gpu-01" aria-label="机器名称"/></label><label>Agent 地址<input id="agent-url" placeholder="http://机器IP:9000" aria-label="Agent 地址"/></label><label>Agent 密钥<input id="agent-token" type="password" autocomplete="off" aria-label="Agent 密钥"/></label><div class="settings-actions"><button class="button secondary" data-action="register-node">添加机器</button></div></details><p class="settings-error" role="alert"></p><div class="settings-actions"><button class="button secondary" data-action="close-settings">关闭</button></div></section></div>`;
   document.querySelector('#controller-url').focus();
+  if (shared()) {
+    document.querySelector('#settings-title').textContent = '团队管理';
+    document.querySelector('.settings-dialog > p').textContent = '服务端连接固定。所有成员可管理共同的机器和部署。';
+    document.querySelector('#controller-url').readOnly = true;
+    document.querySelector('#admin-token').closest('label').remove();
+    document.querySelector('[data-action="save-settings"]').closest('.settings-actions').remove();
+  }
 }
 async function saveSettings(register = false) {
+  const captured = epoch.current();
   const button = document.querySelector(`[data-action="${register ? 'register-node' : 'save-settings'}"]`);
   if (button.disabled) return;
   button.disabled = true; const dialogError = document.querySelector('.settings-error'); dialogError.textContent = '';
   try {
     if (register) await api('/api/control/nodes', { method: 'POST', body: { name: document.querySelector('#agent-name').value, url: document.querySelector('#agent-url').value, token: document.querySelector('#agent-token').value } });
     else await api('/api/local/settings', { method: 'PUT', body: { controllerUrl: document.querySelector('#controller-url').value, adminToken: document.querySelector('#admin-token').value } });
-    await pullState(true); resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT; draft = newDraft(); render();
+    await pullState(true);
+    if (!epoch.isCurrent(captured)) return;
+    if (!shared()) { resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT; draft = newDraft(); render(); }
     document.querySelector(register ? '#agent-token' : '#admin-token').value = '';
     notify(register ? '机器已添加，选择后连接' : '已连接共享控制节点');
-  } catch (cause) { if (dialogError.isConnected) dialogError.textContent = cause.message; }
-  finally { if (button.isConnected) button.disabled = false; }
+  } catch (cause) { if (epoch.isCurrent(captured) && dialogError.isConnected) dialogError.textContent = cause.message; }
+  finally { if (epoch.isCurrent(captured) && button.isConnected) button.disabled = false; }
 }
 
 function clearForm() {
-  editingId = null; draft = newDraft(); error = ''; render();
+  editingId = null; editingRevision = null; retryIntent = null; draft = newDraft(); error = ''; render();
 }
 
 function resetDirectory() {
@@ -261,13 +347,14 @@ function acceptDirectory(result, target, preserve=false) {
   directoryIssue='';
 }
 async function loadDirectory(path,preserve=false) {
+  const captured = epoch.current();
   const target=machineId; directoryLoading=true; directoryIssue=''; rootDraft=path; render();
   try {
     const result=await directoryReader.read(target,path);
-    if (!result || target!==machineId) return;
+    if (!result || target!==machineId || !epoch.isCurrent(captured)) return;
     acceptDirectory(result,target,preserve); directoryLoading=false; render();
   } catch(cause) {
-    if (target!==machineId) return;
+    if (target!==machineId || !epoch.isCurrent(captured)) return;
     directoryLoading=false; directoryIssue=cause.message; directorySnapshot=null;
     if (!preserve) draft.modelPath=''; render();
   }
@@ -313,6 +400,7 @@ function refreshMockTelemetry() {
 
 async function connectMachine() {
   if (connecting) return;
+  const captured = epoch.current();
   connecting = true; error = ''; connectedId = null;
   const target = machineId;
   log(`连接 ${node().name} (${node().host})…`, 'muted');
@@ -326,11 +414,12 @@ async function connectMachine() {
         const selectedRoot=editingId ? rootDraft : result.defaultModelRoot || DEFAULT_MODEL_ROOT;
         await loadDirectory(selectedRoot,!!editingId);
       }
+      if (!epoch.isCurrent(captured)) return;
       log(`已连接 ${result.name} · ${result.gpus.length} 张 GPU`, 'success');
       if (result.gpuError) log(result.gpuError, 'muted');
       if (result.modelError) log(result.modelError, 'muted');
-    } catch (cause) { error = cause.message; log(cause.message, 'muted'); }
-    finally { connecting = false; render(); }
+    } catch (cause) { if (epoch.isCurrent(captured)) { error = cause.message; log(cause.message, 'muted'); } }
+    finally { if (epoch.isCurrent(captured)) { connecting = false; render(); } }
     return;
   }
   setTimeout(async () => {
@@ -362,12 +451,11 @@ async function deploy() {
   if (!Number.isInteger(Number(draft.maxModelLen)) || Number(draft.maxModelLen) < 1 || !Number.isFinite(Number(draft.gpuMemoryUtilization)) || Number(draft.gpuMemoryUtilization) < 0.5 || Number(draft.gpuMemoryUtilization) > 0.98) { error = '显存比例必须为 0.50–0.98，请检查推理参数'; render(); return; }
   if (!demo) {
     const existingId = editingId; const submitted = structuredClone(draft);
-    await perform(async () => {
-      const item = await api(existingId ? `/api/control/deployments/${existingId}` : '/api/control/deployments', { method: existingId ? 'PATCH' : 'POST', body: submitted });
+    await runIntent(intent(existingId ? 'update' : 'create', existingId ? { id: existingId } : null, submitted), async item => {
       selectedId = item.id; rawLog = ''; lastRawLog = '';
       log(`${item.alias} · ${labels[item.status] || item.status} · GPU ${item.gpuIds.join(', ')}`);
       if (item.error) log(item.error, 'muted');
-      editingId = null; draft = newDraft();
+      editingId = null; editingRevision = null; draft = newDraft();
     });
     return;
   }
@@ -391,6 +479,7 @@ function editService(id) {
   machineId = item.nodeId;
   resetDirectory(); rootDraft = item.modelRoot || item.modelPath.slice(0,item.modelPath.lastIndexOf('/')) || '/';
   draft = structuredClone(item);
+  editingRevision = item.revision; retryIntent = null;
   editingId = id; selectedId = id; rawLog = ''; lastRawLog = ''; runtimeLogError = ''; logState = 'loading'; activeView = 'deploy'; error = '';
   log(`载入 ${item.alias} 的部署配置。${connected() ? '修改后保存并重启。' : '请先连接对应机器。'}`, 'muted');
   render();
@@ -401,6 +490,7 @@ function editService(id) {
 function requestStop(id) {
   const item = deployment(id);
   if (!item || item.status === 'stopped') return;
+  confirmationIntent = demo ? null : intent('stop', item);
   document.querySelector('#modal-root').innerHTML = `<div class="dialog-backdrop"><section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="stop-title"><h2 id="stop-title">停止 ${esc(item.alias)}？</h2><p>停止后释放 GPU ${item.gpuIds.join(', ')}，部署配置会保留。</p><div><button class="button secondary" data-action="cancel-stop">取消</button><button class="button stop-button" data-confirm-stop="${id}">停止服务</button></div></section></div>`;
   document.querySelector('[data-action="cancel-stop"]').focus();
 }
@@ -408,20 +498,24 @@ function requestDelete(id) {
   if (busy) return;
   const html = renderDeleteDialog(deployment(id));
   if (!html) { notify('只能删除已停止的服务，请先核对部署状态'); return; }
+  confirmationIntent = demo ? null : intent('delete', deployment(id));
   document.querySelector('#modal-root').innerHTML = `<div class="dialog-backdrop">${html}</div>`;
   document.querySelector('[data-action="cancel-delete"]').focus();
 }
 
 async function confirmDelete(id) {
-  const item = deployment(id); closeDialog();
+  const item = deployment(id); const frozen = confirmationIntent; const captured = epoch.current(); closeDialog();
   if (!renderDeleteDialog(item)) { notify('服务状态已变化，删除已取消'); return; }
   let confirmed = demo;
   if (!demo) {
-    const ok = await perform(async () => {
-      const result = await api(`/api/control/deployments/${id}`, { method: 'DELETE', body: {} });
+    if (!frozen || frozen.id !== id || frozen.kind !== 'delete') return;
+    const ok = await runIntent(frozen, async result => {
       if (result.id !== id || result.deleted !== true) throw new Error('后台未确认删除结果，请恢复连接后重试');
       confirmed = true;
+      if (selectedId === id) { selectedId = null; rawLog = ''; lastRawLog = ''; runtimeLogError = ''; logState = 'idle'; }
+      if (editingId === id) { editingId = null; editingRevision = null; draft = newDraft(); }
     });
+    if (!epoch.isCurrent(captured)) return;
     if (!ok && !confirmed && deployment(id)) { notify(error || '删除结果尚未确认，请恢复连接后重试'); return; }
   } else { state = deleteDeployment(state, id); save(); }
   if (confirmed || !deployment(id)) {
@@ -433,22 +527,32 @@ async function confirmDelete(id) {
   }
 }
 function closeDialog() {
+  confirmationIntent = null;
   const wasDirectory=!!directoryPicker;
   if(wasDirectory) { directoryReader.cancel(); directoryPicker=null; }
   document.querySelector('#modal-root').innerHTML = '';
   if(wasDirectory) document.querySelector('#model-root')?.focus();
 }
 async function copy(text,message='已复制') {
-  try { await navigator.clipboard.writeText(text); notify(message); } catch { notify('复制不可用，请手动选择文本'); }
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+    else {
+      const field = document.createElement('textarea'); field.value = text; field.readOnly = true; field.style.cssText = 'position:fixed;opacity:0';
+      document.body.append(field); field.select();
+      try { if (!document.execCommand('copy')) throw new Error(); } finally { field.remove(); }
+    }
+    notify(message);
+  } catch { notify('复制不可用，请手动选择文本'); }
 }
 
 document.addEventListener('input', (event) => {
   const fields = { 'model-path': 'modelPath', 'service-alias': 'alias', 'gpu-memory': 'gpuMemoryUtilization' };
-  if (fields[event.target.id]) { draft[fields[event.target.id]] = event.target.value; updatePreview(); }
+  if (fields[event.target.id]) { retryIntent = null; document.querySelector('[data-action="retry-mutation"]')?.remove(); draft[fields[event.target.id]] = event.target.value; updatePreview(); }
 });
 document.addEventListener('change', (event) => {
   const target = event.target;
   if (target.id === 'machine') {
+    retryIntent = null; editingRevision = null;
     machineId = target.value; connectedId = null; editingId = null; selectedId = null; rawLog = ''; lastRawLog = '';
     runtimeLogError = ''; logState = 'idle';
     closeDialog(); resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT;
@@ -461,6 +565,7 @@ document.addEventListener('change', (event) => {
   if (target.id === 'model-path') { draft.modelPath=target.value; updatePreview(); }
   if (target.id === 'max-model-len') { draft.maxModelLen = Number(target.value); updatePreview(); }
   if (target.id === 'model-dtype') { draft.dtype = target.value; updatePreview(); }
+  if (['model-path', 'max-model-len', 'model-dtype'].includes(target.id)) { retryIntent = null; document.querySelector('[data-action="retry-mutation"]')?.remove(); }
 });
 document.addEventListener('click', async (event) => {
   const target = event.target.closest('button');
@@ -471,8 +576,14 @@ document.addEventListener('click', async (event) => {
     else notify('服务已移除，请刷新列表');
     return;
   }
+  if (target.dataset.copyLocalApi) {
+    const item = deployment(target.dataset.copyLocalApi); const machine = state.nodes.find(n => n.id === item?.nodeId);
+    if (item && renderLocalApi(item, machine)) await copy(machine.inference.apiBase, `已复制：仅在 ${machine.name} 上调用`);
+    return;
+  }
   if (target.dataset.browsePath!==undefined) { await navigateDirectory(target.dataset.browsePath); return; }
   if (target.dataset.gpu !== undefined) {
+    retryIntent = null;
     const id = Number(target.dataset.gpu);
     draft.gpuIds = draft.gpuIds.includes(id) ? draft.gpuIds.filter((value) => value !== id) : [...draft.gpuIds, id].sort((a, b) => a - b);
     error = ''; render(); document.querySelector(`[data-gpu="${id}"]`)?.focus(); return;
@@ -486,8 +597,10 @@ document.addEventListener('click', async (event) => {
   if (target.dataset.confirmStop) {
     const item = deployment(target.dataset.confirmStop);
     if (!demo) {
+      const frozen = confirmationIntent;
       closeDialog();
-      await perform(async () => { const result = await api(`/api/control/deployments/${item.id}/stop`, { method: 'POST', body: {} }); selectedId = item.id; log(`${item.alias} · ${labels[result.status] || result.status}`); });
+      if (!frozen || frozen.id !== target.dataset.confirmStop || frozen.kind !== 'stop') return;
+      await runIntent(frozen, async result => { selectedId = frozen.id; log(`${result.alias} · ${labels[result.status] || result.status}`); });
       return;
     }
     state = stopDeployment(state, item.id); selectedId = item.id;
@@ -499,7 +612,7 @@ document.addEventListener('click', async (event) => {
     const item = deployment(target.dataset.start);
     if (connectedId !== item.nodeId) { editService(item.id); notify('先连接服务所在机器，再启动'); return; }
     if (!demo) {
-      await perform(async () => { const result = await api(`/api/control/deployments/${item.id}/start`, { method: 'POST', body: {} }); selectedId = item.id; log(`${item.alias} · ${labels[result.status] || result.status}`); });
+      await runIntent(intent('start', item), async result => { selectedId = item.id; log(`${item.alias} · ${labels[result.status] || result.status}`); });
       return;
     }
     try {
@@ -509,6 +622,8 @@ document.addEventListener('click', async (event) => {
     return;
   }
   switch (target.dataset.action) {
+    case 'logout': await logout(); break;
+    case 'retry-mutation': { const retry = retryIntent; if (retry) await runIntent(retry.frozen, retry.onSuccess); break; }
     case 'settings': await showSettings(); break;
     case 'save-settings': await saveSettings(); break;
     case 'register-node': await saveSettings(true); break;
@@ -519,7 +634,7 @@ document.addEventListener('click', async (event) => {
     case 'connect': connectMachine(); break;
     case 'deploy': deploy(); break;
     case 'clear-form': clearForm(); break;
-    case 'toggle-gpus': draft.gpuIds = draft.gpuIds.length ? [] : node().gpus.filter(available).map((gpu) => gpu.id); render(); break;
+    case 'toggle-gpus': retryIntent = null; draft.gpuIds = draft.gpuIds.length ? [] : node().gpus.filter(available).map((gpu) => gpu.id); render(); break;
     case 'refresh-gpus': if (!demo) { await poll(); } else { log('显卡状态已刷新（模拟数据）。', 'muted'); render(); } break;
     case 'copy-command': if (!draft.alias.trim() || !draft.gpuIds.length) { notify('请填写服务别名并选择 GPU'); break; } await copy(buildCommand(draft)); break;
     case 'copy-api': await copy(state.gateway.baseUrl); break;
@@ -530,6 +645,7 @@ document.addEventListener('click', async (event) => {
     case 'cancel-delete': closeDialog(); break;
   }
 });
+document.addEventListener('submit', event => { if (event.target.id === 'team-login') { event.preventDefault(); login(); } });
 document.addEventListener('keydown', (event) => {
   const dialog = document.querySelector('.confirm-dialog');
   if (!dialog) return;
@@ -544,6 +660,11 @@ document.addEventListener('keydown', (event) => {
 render();
 if (demo) { for (const item of state.deployments) if (['starting', 'restarting'].includes(item.status)) completeDeployment(item.id); }
 else {
-  pullState(true).then(() => poll()).catch((cause) => { controlError = cause.message; error = cause.message; render(); });
+  const bootEpoch = epoch.current();
+  requestApi('/api/session').then(async result => {
+    if (!epoch.isCurrent(bootEpoch)) return;
+    session = { ...result, ready: true }; render();
+    if (session.authenticated) { await pullState(true); await poll(); }
+  }).catch(cause => { if (epoch.isCurrent(bootEpoch)) { session.ready = true; loginMessage = cause.message; controlError = cause.message; error = cause.message; render(); } });
   setInterval(poll, 3000);
 }

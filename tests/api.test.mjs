@@ -21,7 +21,7 @@ test('frontend client sends the local console header and displays backend errors
   t.after(() => new Promise((r) => server.close(r)));
   const api = createApi(await listen(server));
   assert.equal((await api('/state')).ok, true);
-  await assert.rejects(api('/failure', { method: 'POST', body: {} }), /GPU occupied/);
+  await assert.rejects(api('/failure', { method: 'POST', body: {} }), { message: 'GPU occupied', status: 409 });
 });
 
 test('selected log errors preserve a successfully loaded shared cluster snapshot', async (t) => {

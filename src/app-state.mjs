@@ -127,6 +127,14 @@ export function renderAliasCopyButton(item) {
   return `<button class="alias-copy-button" data-copy-alias="${escapeHtml(item.id)}" aria-label="复制服务别名 ${escapeHtml(item.alias)}" title="复制 model 字段：${escapeHtml(item.alias)}"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button>`;
 }
 
+export function renderLocalApi(service, node) {
+  if (!node || service.nodeId !== node.id || !/^[a-zA-Z0-9_-]{1,80}$/.test(service.id) || node.inference?.scope !== 'server-local') return '';
+  let url;
+  try { url = new URL(node.inference.apiBase); } catch { return ''; }
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.pathname !== '/v1' || url.username || url.password || url.search || url.hash) return '';
+  return `<small class="service-local-api" title="仅在 ${escapeHtml(node.name)} 上调用"><code>${escapeHtml(url.href)}</code><button class="alias-copy-button" data-copy-local-api="${escapeHtml(service.id)}" aria-label="复制 ${escapeHtml(node.name)} 本机 API" title="在 ${escapeHtml(node.name)} 上调用">复制</button></small>`;
+}
+
 export function createInitialState() {
   return {
     nodes: clone(initialNodes),
