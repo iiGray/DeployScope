@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ApiError, serialQueue, readJson, writeJson, instanceLock, birthTime, bootId, pidAlive, requireToken, bodyJson, json, fail, relay } from './common.mjs';
 import { readGpuStatus, validateDeployment, vllmLaunch } from './gpu.mjs';
 import { checkedRoot, checkedModel, checkedDirectory, listDirectories, scanModels } from './models.mjs';
+import { createLocalInference, validateLocalInference } from './local-inference.mjs';
 
 const occupiedStatuses = new Set(['starting', 'running', 'stopping', 'orphaned']);
 const validId = (id) => /^[a-zA-Z0-9_-]{1,80}$/.test(id);
@@ -79,9 +80,21 @@ class AgentManager {
     let gpus = []; let gpuError = null; let models = []; let modelError = null;
     try { gpus = (await this.hardware()).gpus; } catch (cause) { gpuError = cause.message; }
     try { models = await scanModels(this.data.modelRoot); } catch (cause) { modelError = cause.message; }
-    return { id: this.config.id, name: this.config.name || this.config.id, host: this.config.hostName || this.config.name || this.config.id, status: 'online', heartbeat: '刚刚', driver: gpus[0]?.driver || '—', modelRoot: this.data.modelRoot, defaultModelRoot: this.config.defaultModelRoot || '/data/hf_models', modelBrowseRoot:this.config.modelBrowseRoot || '/data', models, gpus, gpuError, modelError, deployments: this.data.deployments.map(publicDeployment) };
+    return { id: this.config.id, name: this.config.name || this.config.id, host: this.config.hostName || this.config.name || this.config.id, status: 'online', heartbeat: '刚刚', driver: gpus[0]?.driver || '—', modelRoot: this.data.modelRoot, defaultModelRoot: this.config.defaultModelRoot || '/data/hf_models', modelBrowseRoot:this.config.modelBrowseRoot || '/data', models, gpus, gpuError, modelError, deployments: this.data.deployments.map(publicDeployment), ...(this.config.localInference?.enabled ? { inference: { scope: 'server-local', apiBase: `http://127.0.0.1:${this.config.localInference.port || 18080}/v1` } } : {}) };
   }
   snapshot() { return this.queue(() => this.snapshotInternal()); }
+  localModels() { return this.queue(async () => {
+    await this.refresh();
+    return this.data.deployments.filter(record => record.status === 'running').map(record => ({ id: record.alias, object: 'model', created: Math.floor(Date.parse(record.createdAt) / 1000) || 0, owned_by: this.config.id }));
+  }); }
+  localTarget(alias) { return this.queue(async () => {
+    if (typeof alias !== 'string' || !alias) throw new ApiError(400, 'model 必须为本机服务别名');
+    const record = this.data.deployments.find(item => item.alias === alias);
+    if (!record) throw new ApiError(404, '本机模型别名不存在');
+    await this.refresh([record]);
+    if (record.status !== 'running') throw new ApiError(503, '本机模型尚未就绪');
+    return { url: `http://127.0.0.1:${record.port}`, apiKey: record.apiKey, alias: record.alias };
+  }); }
   status(id) { return this.queue(async () => { const record = this.find(id); await this.refresh([record]); return publicDeployment(record); }); }
   browse(path = this.config.defaultModelRoot || '/data/hf_models') { return listDirectories(this.config.modelBrowseRoot || '/data',path); }
   async rootFor(draft) {
@@ -235,8 +248,10 @@ class AgentManager {
 
 export async function createAgent(config, dependencies = {}) {
   if (!config.id || !config.token || config.token.length < 16) throw new Error('Agent 需要机器 ID 和至少 16 位的访问密钥');
+  if (config.localInference?.enabled) validateLocalInference(config.localInference);
   const manager = new AgentManager(config, dependencies);
-  await manager.initialize();
+  try { await manager.initialize(); } catch (cause) { clearInterval(manager.timer); await manager.releaseLock?.(); throw cause; }
+  const localInference = config.localInference?.enabled ? createLocalInference(manager, config.localInference) : null;
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url, 'http://localhost');
@@ -256,6 +271,7 @@ export async function createAgent(config, dependencies = {}) {
         if (action === 'stop' && request.method === 'POST') { json(response, await manager.stop(id)); return; }
         if (!action && request.method === 'PATCH') { json(response, await manager.update(id, await bodyJson(request))); return; }
         if (action?.startsWith('inference/') && request.method === 'POST') {
+          if (localInference) throw new ApiError(404, '管理接口不提供推理');
           const record = manager.find(id);
           if (record.status !== 'running') throw new ApiError(503, '模型服务尚未就绪');
           const body = await bodyJson(request, 10 * 1024 * 1024);
@@ -266,5 +282,5 @@ export async function createAgent(config, dependencies = {}) {
     } catch (cause) { fail(response, cause); }
   });
   let closed;
-  return { manager, server, close: () => closed ||= (async () => { server.closeAllConnections(); if (server.listening) await new Promise((resolve) => server.close(resolve)); await manager.shutdown(); })() };
+  return { manager, server, localInference, close: () => closed ||= (async () => { await localInference?.close(); server.closeAllConnections(); if (server.listening) await new Promise((resolve) => server.close(resolve)); await manager.shutdown(); })() };
 }

@@ -59,7 +59,7 @@ class ControllerManager {
     }).filter(Boolean);
     if (removed.length) await this.archiveRemoved(removed);
     else if (changed) await this.persist();
-    return { nodes: nodes.map(({ deployments, ...node }) => node), services, apiBase: `${httpUrl(this.config.publicUrl)}/v1` };
+    return { nodes: nodes.map(({ deployments, ...node }) => node), services, inferenceMode: this.config.inferenceEnabled === false ? 'per-node' : 'controller', apiBase: this.config.inferenceEnabled === false ? null : `${httpUrl(this.config.publicUrl)}/v1` };
   }
   state() { return this.queue(() => this.stateInternal()); }
   register(input) {
@@ -184,6 +184,7 @@ export async function createController(config) {
       const path = new URL(request.url, 'http://localhost').pathname;
       if (path === '/health' && request.method === 'GET') { json(response, { service: 'gpu-monitor-controller', ok: true }); return; }
       if (path.startsWith('/v1/')) {
+        if (config.inferenceEnabled === false) throw new ApiError(404, '控制节点不提供跨机推理');
         requireToken(request, config.apiKeys);
         if (path === '/v1/models' && request.method === 'GET') { const state = await manager.state(); json(response, { object: 'list', data: state.services.filter((s) => s.status === 'running').map((s) => ({ id: s.alias, object: 'model', created: Math.floor(Date.parse(s.createdAt) / 1000) || 0, owned_by: 'gpu-monitor' })) }); return; }
         if (['/v1/chat/completions', '/v1/completions'].includes(path) && request.method === 'POST') {

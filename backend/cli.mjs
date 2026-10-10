@@ -23,7 +23,11 @@ try {
   if (!config) throw new Error('配置不存在，请先运行 npm run init');
   if (role === 'init') console.log(`私有配置已准备：${file}（不会覆盖已有配置）`);
   else {
-    if (['dev', 'agent'].includes(role)) await start(await createAgent(config.agent), config.agent, 'Agent');
+    if (['dev', 'agent'].includes(role)) {
+      const agent = await createAgent(config.agent);
+      await start(agent, config.agent, 'Agent');
+      if (agent.localInference) await start(agent.localInference, { port: config.agent.localInference.port || 18080 }, '本机推理 API', '127.0.0.1');
+    }
     if (['dev', 'controller'].includes(role)) await start(await createController(config.controller), config.controller, '统一 API / 控制节点');
     if (['dev', 'console'].includes(role)) {
       const ui = { ...config.console, port: Number(process.env.GPU_MONITOR_PORT || config.console.port || 5173) };
