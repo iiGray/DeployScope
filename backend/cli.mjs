@@ -31,7 +31,7 @@ try {
     if (['dev', 'controller'].includes(role)) await start(await createController(config.controller), config.controller, '统一 API / 控制节点');
     if (['dev', 'console'].includes(role)) {
       const ui = { ...config.console, port: Number(process.env.GPU_MONITOR_PORT || config.console.port || 5173) };
-      await start(await createConsole(ui), ui, 'GPU Monitor', '127.0.0.1');
+      await start(await createConsole(ui), ui, 'GPU Monitor', ui.mode === 'shared' ? ui.host || '127.0.0.1' : '127.0.0.1');
     }
   }
 } catch (cause) { console.error(cause.message); await shutdown(); process.exitCode = 1; }

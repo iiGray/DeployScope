@@ -38,9 +38,19 @@ export function fail(response, cause) {
   if (response.headersSent) { response.destroy(); return; }
   json(response, { error: { message: cause.status ? cause.message : '服务内部错误', type: 'gpu_monitor_error' } }, cause.status || 500);
 }
-export async function bodyJson(request, maxBytes = 1024 * 1024) {
+export async function bodyJson(request, maxBytes = 1024 * 1024, { timeoutMs } = {}) {
   const chunks = []; let size = 0;
-  for await (const chunk of request) { size += chunk.length; if (size > maxBytes) throw new ApiError(413, '请求内容过大'); chunks.push(chunk); }
+  await new Promise((resolveBody, rejectBody) => {
+    let timer;
+    const cleanup = () => { clearTimeout(timer); request.off('data', onData); request.off('end', onEnd); request.off('error', onError); request.off('aborted', onAborted); };
+    const reject = cause => { cleanup(); request.pause(); rejectBody(cause); };
+    const onData = chunk => { size += chunk.length; if (size > maxBytes) { reject(new ApiError(413, '请求内容过大')); return; } chunks.push(Buffer.from(chunk)); };
+    const onEnd = () => { cleanup(); resolveBody(); };
+    const onError = () => reject(new ApiError(400, '请求接收失败'));
+    const onAborted = () => reject(new ApiError(400, '请求已断开'));
+    request.on('data', onData); request.once('end', onEnd); request.once('error', onError); request.once('aborted', onAborted);
+    if (timeoutMs !== undefined) timer = setTimeout(() => reject(new ApiError(408, '请求内容接收超时')), timeoutMs);
+  });
   try { const value = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(); return value; }
   catch { throw new ApiError(400, '请求必须是 JSON 对象'); }
 }
