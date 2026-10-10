@@ -150,3 +150,22 @@ test('a live process group retains GPU ownership when its main process exits', a
   assert.equal((await agent.manager.hardware()).gpus[0].deploymentId, dep.id);
   await assert.rejects(agent.manager.create(draft(f.models, { alias: 'later', id: 'dep-later', operationId: 'op-later' })), { status: 409 });
 });
+
+test('two authenticated HTTP clients share deployment state while local gateways keep model lists isolated', async t => {
+  const c = await setup(t); const [a, b] = c.clients;
+  const one = await (await submit(a, input(c, { alias: 'local-a' }))).json();
+  await submit(b, input(c, { nodeId: 'node-b', alias: 'local-b', requestId: 'local-b-create' }));
+  await waitFor(async () => (await c.controller.manager.state()).services.every(s => s.status === 'running'));
+  const stateA = await (await a.request('/api/control/state')).json(); const stateB = await (await b.request('/api/control/state')).json();
+  assert.deepEqual(stateA.services.map(s => s.id), stateB.services.map(s => s.id));
+  for (const [index, alias] of ['local-a', 'local-b'].entries()) {
+    const response = await fetch(c.agents[index].gatewayUrl + '/v1/models', { headers: { Authorization: `Bearer local-key-node-${index ? 'b' : 'a'}-independent` } });
+    assert.deepEqual((await response.json()).data.map(m => m.id), [alias]);
+  }
+  const remote = await fetch(c.config.nodes[0].url + `/api/deployments/${one.id}/inference/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${c.config.nodes[0].token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'local-a' }) });
+  assert.equal(remote.status, 404);
+  const controllerUrl = `http://127.0.0.1:${c.controller.server.address().port}`;
+  assert.equal((await fetch(controllerUrl + '/v1/models')).status, 404);
+  await a.request('/api/session/logout', { method: 'POST', body: {} });
+  assert.equal((await a.request('/api/control/state')).status, 401); assert.equal((await b.request('/api/control/state')).status, 200);
+});
