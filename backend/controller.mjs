@@ -3,6 +3,7 @@ import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ApiError, serialQueue, readJson, writeJson, instanceLock, requireToken, bodyJson, json, fail, httpUrl, remoteJson, relay } from './common.mjs';
 import { validateDeployment } from './gpu.mjs';
+import { requireMutationId, fingerprintMutation, getReceipt, pruneReceipts } from './mutations.mjs';
 
 const sameDraft = (a, b) => ['alias', 'modelPath', 'modelRoot', 'gpuIds', 'maxModelLen', 'gpuMemoryUtilization', 'dtype'].every((key) => JSON.stringify(a[key]) === JSON.stringify(b[key]));
 const publicNode = ({ token, ...node }) => node;
@@ -12,9 +13,95 @@ class ControllerManager {
   async initialize() {
     this.releaseLock = await instanceLock(resolve(this.config.stateDir));
     this.data = await readJson(this.file, { nodes: (this.config.nodes || []).map((node) => ({ ...node, url: httpUrl(node.url) })), services: [] });
+    this.data.mutationReceipts = pruneReceipts(this.data.mutationReceipts);
+    this.data.lastSubmissionSeq ||= 0;
+    for (const record of this.data.services) record.revision ||= 1;
     await this.persist();
   }
   persist() { return writeJson(this.file, this.data); }
+  async settleMutation(receipt, result, error = null) {
+    const next = structuredClone(this.data);
+    const saved = next.mutationReceipts.find(r => r.requestId === receipt.requestId);
+    let record = next.services.find(r => r.id === receipt.serviceId);
+    if (error) {
+      saved.status = 'rejected'; saved.error = { status: error.status, message: error.message };
+      next.services = next.services.filter(r => r.id !== receipt.serviceId);
+      if (saved.previous) next.services.push(saved.previous);
+    } else {
+      saved.status = 'confirmed';
+      if (receipt.kind === 'delete') {
+        if (result?.id !== receipt.serviceId || result.deleted !== true) throw new ApiError(502, 'Agent 未确认删除身份');
+        if (record) (next.deletedServices ||= []).push({ ...record, deletedAt: new Date().toISOString() });
+        next.services = next.services.filter(r => r.id !== receipt.serviceId);
+        saved.result = { id: receipt.serviceId, deleted: true, revision: receipt.revision, submissionSeq: receipt.submissionSeq };
+      } else {
+        if (result?.id !== receipt.serviceId || result.appliedOperationId !== receipt.operationId) throw new ApiError(502, 'Agent 未确认本次操作身份');
+        if (!record) throw new ApiError(502, '操作保留记录不存在');
+        Object.assign(record, result, { nodeId: receipt.nodeId, revision: receipt.revision, submissionSeq: receipt.submissionSeq });
+        delete record.pendingMutation; delete record.deletePending;
+        saved.result = structuredClone(record);
+      }
+    }
+    saved.completedAt = Date.now(); delete saved.previous;
+    next.mutationReceipts = pruneReceipts(next.mutationReceipts);
+    await writeJson(this.file, next); this.data = next; this.readyCache.delete(receipt.serviceId);
+    return structuredClone(saved.result);
+  }
+  async mutate(kind, id, input) {
+    const requestId = requireMutationId(input.requestId);
+    if (kind !== 'create' && (!Number.isInteger(input.expectedRevision) || input.expectedRevision < 1)) throw new ApiError(400, '需要有效的 expectedRevision');
+    const fingerprint = fingerprintMutation({ kind, serviceId: id, payload: input });
+    let receipt = getReceipt(this.data, requestId, fingerprint);
+    if (receipt?.status === 'confirmed') return structuredClone(receipt.result);
+    if (receipt?.status === 'rejected') throw new ApiError(receipt.error.status, receipt.error.message);
+    if (!receipt) {
+      let draft; let previous = null; let node;
+      if (kind === 'create') {
+        draft = validateDeployment(input); node = this.node(input.nodeId); this.aliasAvailable(draft.alias);
+        id = `dep-${randomUUID()}`;
+      } else {
+        previous = structuredClone(this.service(id)); node = this.node(previous.nodeId);
+        if (previous.revision !== input.expectedRevision) throw new ApiError(409, '服务已被其他操作修改，请刷新并重新确认');
+        if (previous.pendingMutation || previous.pending || previous.deletePending) throw new ApiError(409, '上一次操作结果尚未确认，请重试相同请求');
+        if (kind === 'update') {
+          if (input.nodeId !== previous.nodeId) throw new ApiError(400, '暂不支持跨机器修改');
+          draft = validateDeployment(input.modelRoot === undefined && previous.modelRoot !== undefined ? { ...input, modelRoot: previous.modelRoot } : input);
+          this.aliasAvailable(draft.alias, id);
+        }
+        if (kind === 'delete' && previous.status !== 'stopped') throw new ApiError(409, '只能删除已停止的部署');
+      }
+      receipt = { requestId, fingerprint, kind, serviceId: id, nodeId: node.id, operationId: `op-${randomUUID()}`, status: 'pending', acceptedAt: Date.now(), submissionSeq: ++this.data.lastSubmissionSeq, revision: previous ? previous.revision + 1 : 1, previous, payload: draft || {} };
+      this.data.mutationReceipts.push(receipt);
+      if (!previous) this.data.services.push({ ...draft, id, nodeId: node.id, status: 'unknown', createdAt: new Date().toISOString() });
+      const record = this.service(id);
+      record.revision = receipt.revision; record.submissionSeq = receipt.submissionSeq; record.pendingMutation = requestId;
+      if (kind === 'delete') record.deletePending = true;
+      await this.persist();
+    }
+    this.readyCache.delete(receipt.serviceId);
+    try {
+      const path = `/api/deployments/${receipt.serviceId}`;
+      const body = { ...receipt.payload, operationId: receipt.operationId };
+      let result;
+      if (kind === 'create') result = await this.call(this.node(receipt.nodeId), '/api/deployments', 'POST', { ...body, id: receipt.serviceId, nodeId: receipt.nodeId });
+      else if (kind === 'update') result = await this.call(this.node(receipt.nodeId), path, 'PATCH', { ...body, nodeId: receipt.nodeId });
+      else result = await this.call(this.node(receipt.nodeId), kind === 'delete' ? path : `${path}/${kind}`, kind === 'delete' ? 'DELETE' : 'POST', body);
+      return await this.settleMutation(receipt, result);
+    } catch (cause) {
+      if (cause.status >= 400 && cause.status < 500) await this.settleMutation(receipt, null, cause);
+      throw cause;
+    }
+  }
+  async reconcileMutations() {
+    for (const receipt of this.data.mutationReceipts.filter(r => r.status === 'pending')) {
+      try {
+        const operation = await this.call(this.node(receipt.nodeId), `/api/operations/${receipt.operationId}`, 'GET', undefined, 2500);
+        if (operation.kind !== receipt.kind || operation.serviceId !== receipt.serviceId) continue;
+        if (operation.status === 'confirmed') await this.settleMutation(receipt, operation.result);
+        else if (operation.status === 'rejected') await this.settleMutation(receipt, null, operation.error);
+      } catch {}
+    }
+  }
   async archiveRemoved(records) {
     const next = structuredClone(this.data); const ids = new Set(records.map(record => record.id));
     const archive = next.deletedServices ||= [];
@@ -31,9 +118,11 @@ class ControllerManager {
   service(id) { const service = this.data.services.find((s) => s.id === id); if (!service) throw new ApiError(404, '部署不存在'); return service; }
   aliasAvailable(alias, exceptId) {
     if (this.data.services.some((s) => s.id !== exceptId && (s.alias === alias || s.pending?.alias === alias))) throw new ApiError(409, '服务别名已存在，请使用其他别名');
+    if (this.data.mutationReceipts.some(r => r.status === 'pending' && r.serviceId !== exceptId && r.payload?.alias === alias)) throw new ApiError(409, '服务别名已由待确认操作保留');
   }
   call(node, path, method = 'GET', body, timeout = 30000) { return remoteJson(node.url + path, node.token, { method, body, timeout }); }
   async stateInternal() {
+    if (this.config.multiUser) await this.reconcileMutations();
     const nodes = await Promise.all(this.data.nodes.map(async (node) => {
       try { const snapshot = await this.call(node, '/api/node', 'GET', undefined, 6500); if (snapshot.id !== node.id) throw new ApiError(502, '机器 ID 与注册信息不一致'); return { ...snapshot, name: node.name || snapshot.name, agentUrl: node.url }; }
       catch (cause) { return { ...publicNode(node), agentUrl: node.url, host: new URL(node.url).host, status: 'offline', gpus: [], models: [], deployments: [], error: cause.message, modelRoot: '', heartbeat: '离线' }; }
@@ -42,6 +131,9 @@ class ControllerManager {
     const services = this.data.services.map((record) => {
       const node = nodes.find((n) => n.id === record.nodeId);
       const remote = node?.deployments.find((d) => d.id === record.id);
+      if (record.pendingMutation) {
+        return { ...record, status: 'unknown', error: '操作结果尚未确认，请重试原请求或恢复连接' };
+      }
       if (record.deletePending) {
         if (node?.status === 'online' && !remote) { removed.push(record); return null; }
         if (remote?.status === 'stopped') return { ...remote, nodeId: record.nodeId, deletePending: true, error: '删除结果尚未确认，请重试删除' };
@@ -52,7 +144,7 @@ class ControllerManager {
         if (record.pending || !sameDraft(record, remote) || record.status !== remote.status) {
           Object.assign(record, remote); delete record.pending; delete record.pendingOperationId; changed = true;
         }
-        return { ...remote, nodeId: record.nodeId };
+        return { ...remote, nodeId: record.nodeId, revision: record.revision, submissionSeq: record.submissionSeq };
       }
       const { pending, pendingOperationId, ...safe } = record;
       return { ...safe, ...(pending || {}), status: 'unknown', error: node?.status === 'offline' ? '机器离线，无法确认部署状态' : '操作结果尚未确认，请检查日志或重试' };
@@ -73,7 +165,7 @@ class ControllerManager {
       for (const dep of snapshot.deployments) this.aliasAvailable(dep.alias, dep.id);
       const node = { id: snapshot.id, name: String(input.name || snapshot.name || snapshot.id).slice(0, 80), url, token: input.token };
       if (existing) Object.assign(existing, node); else this.data.nodes.push(node);
-      for (const dep of snapshot.deployments) if (!this.data.services.some((s) => s.id === dep.id)) this.data.services.push({ ...dep, nodeId: node.id });
+      for (const dep of snapshot.deployments) if (!this.data.services.some((s) => s.id === dep.id)) this.data.services.push({ ...dep, nodeId: node.id, revision: 1 });
       await this.persist(); return publicNode(node);
     });
   }
@@ -81,6 +173,7 @@ class ControllerManager {
   setRoot(id, root) { return this.queue(() => this.call(this.node(id), '/api/model-root', 'PUT', { modelRoot: root })); }
   browse(id,path) { return this.call(this.node(id),'/api/directories','POST',path===undefined ? {} : {path}); }
   create(input) {
+    if (this.config.multiUser) return this.queue(() => this.mutate('create', null, input));
     return this.queue(async () => {
       const draft = validateDeployment(input); const node = this.node(input.nodeId);
       this.aliasAvailable(draft.alias);
@@ -94,6 +187,7 @@ class ControllerManager {
     });
   }
   update(id, input) {
+    if (this.config.multiUser) return this.queue(() => this.mutate('update', id, input));
     return this.queue(async () => {
       let record = this.service(id);
       if (record.deletePending) throw new ApiError(409, '删除结果尚未确认，不能修改部署，请先完成删除确认');
@@ -109,7 +203,8 @@ class ControllerManager {
       catch (cause) { if (cause.status >= 400 && cause.status < 500 && !previous) { delete record.pending; delete record.pendingOperationId; await this.persist(); } throw cause; }
     });
   }
-  action(id, action) {
+  action(id, action, input = {}) {
+    if (this.config.multiUser) return this.queue(() => this.mutate(action, id, input));
     return this.queue(async () => {
       const record = this.service(id); const node = this.node(record.nodeId);
       if (record.deletePending) throw new ApiError(409, '删除结果尚未确认，不能改变部署状态，请先完成删除确认');
@@ -128,7 +223,8 @@ class ControllerManager {
     });
   }
   logs(id) { const record = this.service(id); return this.call(this.node(record.nodeId), `/api/deployments/${id}/logs`); }
-  remove(id) {
+  remove(id, input = {}) {
+    if (this.config.multiUser) return this.queue(() => this.mutate('delete', id, input));
     return this.queue(async () => {
       let record = this.data.services.find(item => item.id === id);
       if (!record) {
@@ -203,8 +299,8 @@ export async function createController(config) {
       if (path === '/api/deployments' && request.method === 'POST') { json(response, await manager.create(await bodyJson(request)), 201); return; }
       const depMatch = /^\/api\/deployments\/([a-zA-Z0-9_-]{1,80})(?:\/(start|stop|logs))?$/.exec(path);
       if (depMatch && !depMatch[2] && request.method === 'PATCH') { json(response, await manager.update(depMatch[1], await bodyJson(request))); return; }
-      if (depMatch && !depMatch[2] && request.method === 'DELETE') { await bodyJson(request); json(response, await manager.remove(depMatch[1])); return; }
-      if (depMatch && ['start', 'stop'].includes(depMatch[2]) && request.method === 'POST') { json(response, await manager.action(depMatch[1], depMatch[2])); return; }
+      if (depMatch && !depMatch[2] && request.method === 'DELETE') { json(response, await manager.remove(depMatch[1], await bodyJson(request))); return; }
+      if (depMatch && ['start', 'stop'].includes(depMatch[2]) && request.method === 'POST') { json(response, await manager.action(depMatch[1], depMatch[2], await bodyJson(request))); return; }
       if (depMatch?.[2] === 'logs' && request.method === 'GET') { json(response, await manager.logs(depMatch[1])); return; }
       throw new ApiError(404, '接口不存在');
     } catch (cause) { fail(response, cause); }

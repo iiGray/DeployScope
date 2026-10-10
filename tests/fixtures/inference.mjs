@@ -1,9 +1,11 @@
 import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
 const args = process.argv.slice(2);
 const port = Number(args[args.indexOf('--port') + 1]);
 const alias = args[args.indexOf('--served-model-name') + 1];
 const key = args[args.indexOf('--api-key') + 1];
 const readyAt = Date.now() + (args.includes('--test-slow-health') ? 1000 : 0);
+if (args.includes('--test-group-child')) spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }).unref();
 const server = createServer(async (request, response) => {
   if (request.url === '/health') { response.writeHead(Date.now() >= readyAt ? 200 : 503).end('ok'); return; }
   if (request.headers.authorization !== `Bearer ${key}`) { response.writeHead(401).end(); return; }

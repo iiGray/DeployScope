@@ -11,11 +11,12 @@ import { ApiError, serialQueue, readJson, writeJson, instanceLock, birthTime, bo
 import { readGpuStatus, validateDeployment, vllmLaunch } from './gpu.mjs';
 import { checkedRoot, checkedModel, checkedDirectory, listDirectories, scanModels } from './models.mjs';
 import { createLocalInference, validateLocalInference } from './local-inference.mjs';
+import { requireMutationId, fingerprintMutation, getReceipt, pruneReceipts } from './mutations.mjs';
 
 const occupiedStatuses = new Set(['starting', 'running', 'stopping', 'orphaned']);
 const validId = (id) => /^[a-zA-Z0-9_-]{1,80}$/.test(id);
 const publicDeployment = (record) => {
-  const { apiKey, birth, bootId, port, ...publicRecord } = record;
+  const { apiKey, birth, bootId, port, reservedOperationId, ...publicRecord } = record;
   return structuredClone(publicRecord);
 };
 const groupAlive = (pid) => { if (!Number.isInteger(pid) || pid < 2) return false; try { process.kill(-pid, 0); return true; } catch (cause) { return cause.code === 'EPERM'; } };
@@ -32,9 +33,13 @@ class AgentManager {
     this.releaseLock = await instanceLock(this.directory);
     this.bootId = await bootId();
     this.data = await readJson(this.file, { modelRoot: this.config.modelRoot || '/models', deployments: [] });
+    this.data.mutationReceipts = pruneReceipts(this.data.mutationReceipts);
+    for (const receipt of this.data.mutationReceipts) if (receipt.status === 'pending' && receipt.result) { receipt.status = 'confirmed'; receipt.completedAt = Date.now(); }
     for (const record of this.data.deployments) {
       if (!occupiedStatuses.has(record.status)) continue;
-      if (!pidAlive(record.pid) && !groupAlive(record.pid)) { record.status = 'failed'; record.error = 'Agent 恢复时发现推理进程已退出'; }
+      const uncertainLaunch = this.data.mutationReceipts.some(r => r.status === 'pending' && r.requestId === record.reservedOperationId && ['create', 'start', 'update'].includes(r.kind));
+      if (!record.pid && uncertainLaunch) { record.status = 'orphaned'; record.error = '启动操作中断且进程身份未知，GPU 保持锁定，请在服务器核对'; }
+      else if (!pidAlive(record.pid) && !groupAlive(record.pid)) { record.status = 'failed'; record.error = 'Agent 恢复时发现推理进程已退出'; }
       else if (!record.birth || record.bootId !== this.bootId || await birthTime(record.pid) !== record.birth) { record.status = 'orphaned'; record.error = '残留进程身份无法确认，请在机器上检查；GPU 保持锁定'; }
     }
     await this.persist();
@@ -42,6 +47,51 @@ class AgentManager {
     this.timer.unref();
   }
   persist() { return writeJson(this.file, this.data); }
+  checkpoint(record) {
+    if (!this.activeReceipt) return;
+    record.appliedOperationId = this.activeReceipt.requestId;
+    this.activeReceipt.result = publicDeployment(record);
+  }
+  operation(id) {
+    requireMutationId(id);
+    const receipt = this.data.mutationReceipts.find(r => r.requestId === id);
+    if (!receipt) throw new ApiError(404, '操作尚未收到');
+    return structuredClone({ kind: receipt.kind, serviceId: receipt.serviceId, status: receipt.status, result: receipt.result, error: receipt.error });
+  }
+  async coordinated(kind, id, input, work) {
+    if (!this.config.coordinatedWrites) return work();
+    const operationId = requireMutationId(input.operationId);
+    requireMutationId(id);
+    const fingerprint = fingerprintMutation({ kind, serviceId: id, payload: input });
+    let receipt = getReceipt(this.data, operationId, fingerprint);
+    if (receipt?.status === 'confirmed') return structuredClone(receipt.result);
+    if (receipt?.status === 'rejected') throw new ApiError(receipt.error.status, receipt.error.message);
+    if (receipt?.result) { receipt.status = 'confirmed'; receipt.completedAt = Date.now(); await this.persist(); return structuredClone(receipt.result); }
+    if (receipt && this.data.deployments.some(r => r.id === id && r.reservedOperationId === operationId && r.status === 'orphaned')) throw new ApiError(503, '启动结果未知，请在服务器核对；不能重复启动');
+    if (!receipt) {
+      if (this.data.mutationReceipts.some(r => r.status === 'pending' && r.serviceId === id)) throw new ApiError(409, '上次操作结果尚未确认');
+      receipt = { requestId: operationId, fingerprint, kind, serviceId: id, status: 'pending', acceptedAt: Date.now() };
+      this.data.mutationReceipts.push(receipt); await this.persist();
+    }
+    const before = JSON.stringify(this.data.deployments.find(r => r.id === id));
+    this.activeReceipt = receipt;
+    try {
+      const result = await work();
+      receipt = this.data.mutationReceipts.find(r => r.requestId === operationId);
+      const record = this.data.deployments.find(r => r.id === id);
+      if (record) record.appliedOperationId = operationId;
+      receipt.result = record ? publicDeployment(record) : result;
+      receipt.status = 'confirmed'; receipt.completedAt = Date.now();
+      this.data.mutationReceipts = pruneReceipts(this.data.mutationReceipts); await this.persist();
+      return structuredClone(receipt.result);
+    } catch (cause) {
+      receipt = this.data.mutationReceipts.find(r => r.requestId === operationId);
+      if (cause.status >= 400 && cause.status < 500 && !receipt.effectsStarted && before === JSON.stringify(this.data.deployments.find(r => r.id === id))) {
+        receipt.status = 'rejected'; receipt.error = { status: cause.status, message: cause.message }; receipt.completedAt = Date.now(); await this.persist();
+      } else if (cause.status >= 400 && cause.status < 500) throw new ApiError(502, '操作已部分执行，结果待核对；GPU 保持保护');
+      throw cause;
+    } finally { this.activeReceipt = null; }
+  }
   find(id) { const record = this.data.deployments.find((item) => item.id === id); if (!record) throw new ApiError(404, '部署不存在'); return record; }
   async identity(record) {
     if (!pidAlive(record.pid) || record.bootId !== this.bootId) return false;
@@ -114,7 +164,7 @@ class AgentManager {
     return gpus;
   }
   create(input) {
-    return this.queue(async () => {
+    return this.queue(() => this.coordinated('create', input.id, input, async () => {
       if (this.closed) throw new ApiError(503, 'Agent 正在停止');
       await this.refresh();
       const draft = validateDeployment(input);
@@ -129,13 +179,15 @@ class AgentManager {
       if (this.data.deployments.some((record) => record.alias === draft.alias)) throw new ApiError(409, '服务别名已存在');
       const gpus = await this.validateResources(draft);
       const record = { ...draft, id, nodeId: this.config.id, status: 'starting', gpuUuids: draft.gpuIds.map((id) => gpus.find((gpu) => gpu.id === id).uuid), apiKey: randomBytes(24).toString('hex'), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      if (this.activeReceipt) { this.activeReceipt.effectsStarted = true; record.reservedOperationId = this.activeReceipt.requestId; }
       this.data.deployments.push(record);
       await this.persist();
       await this.launch(record, gpus);
       return publicDeployment(record);
-    });
+    }));
   }
   async launch(record, gpus) {
+    if (this.activeReceipt) { this.activeReceipt.effectsStarted = true; record.reservedOperationId = this.activeReceipt.requestId; }
     record.port = await freePort(); record.status = 'starting'; record.error = null; record.createdAt = new Date().toISOString(); record.updatedAt = record.createdAt;
     record.gpuUuids = record.gpuIds.map((id) => gpus.find((gpu) => gpu.id === id).uuid);
     record.pid = null; record.birth = null; record.bootId = this.bootId;
@@ -158,16 +210,18 @@ class AgentManager {
       await once(child, 'spawn');
       record.pid = child.pid; record.birth = await birthTime(child.pid);
       this.owned.set(record.id, child);
+      this.checkpoint(record);
       await this.persist();
     } catch {
       if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
       record.status = 'failed'; record.pid = null; record.birth = null; record.error = '无法启动 vLLM，请检查可执行文件路径和运行环境';
       stream.write(record.error + '\n'); stream.end();
+      this.checkpoint(record);
       await this.persist();
     }
   }
   async stopInternal(record) {
-    if (!record.pid || (!pidAlive(record.pid) && !groupAlive(record.pid))) { record.status = 'stopped'; record.pid = null; record.birth = null; await this.persist(); return; }
+    if (!record.pid || (!pidAlive(record.pid) && !groupAlive(record.pid))) { record.status = 'stopped'; record.pid = null; record.birth = null; if (this.activeReceipt?.kind === 'stop') this.checkpoint(record); await this.persist(); return; }
     if (!await this.identity(record)) { record.status = 'orphaned'; await this.persist(); throw new ApiError(409, '无法确认残留进程身份，拒绝停止；请在机器上检查'); }
     record.status = 'stopping'; await this.persist();
     try { process.kill(-record.pid, 'SIGTERM'); } catch (cause) { if (cause.code !== 'ESRCH') throw cause; }
@@ -181,11 +235,12 @@ class AgentManager {
     while (groupAlive(record.pid) && Date.now() < killed) await delay(30);
     if (groupAlive(record.pid)) { record.status = 'orphaned'; await this.persist(); throw new ApiError(409, '进程组尚未退出，GPU 保持占用'); }
     this.owned.delete(record.id); record.pid = null; record.birth = null; record.status = 'stopped'; record.error = null; record.updatedAt = new Date().toISOString();
+    if (this.activeReceipt?.kind === 'stop') this.checkpoint(record);
     await this.persist();
   }
-  stop(id) { return this.queue(async () => { const record = this.find(id); await this.stopInternal(record); return publicDeployment(record); }); }
-  remove(id) {
-    return this.queue(async () => {
+  stop(id, input = {}) { return this.queue(() => this.coordinated('stop', id, input, async () => { const record = this.find(id); if (this.activeReceipt) { this.activeReceipt.effectsStarted = true; await this.persist(); } await this.stopInternal(record); return publicDeployment(record); })); }
+  remove(id, input = {}) {
+    return this.queue(() => this.coordinated('delete', id, input, async () => {
       if (this.closed) throw new ApiError(503, 'Agent 正在停止');
       const record = this.data.deployments.find(item => item.id === id);
       if (!record) {
@@ -197,11 +252,12 @@ class AgentManager {
       const next = structuredClone(this.data);
       next.deployments = next.deployments.filter(item => item.id !== id);
       (next.deletedDeployments ||= []).push({ ...structuredClone(record), deletedAt: new Date().toISOString() });
+      if (this.activeReceipt) next.mutationReceipts.find(r => r.requestId === this.activeReceipt.requestId).result = { id, deleted: true };
       await writeJson(this.file, next); this.data = next;
       return { id, deleted: true };
-    });
+    }));
   }
-  start(id) { return this.queue(async () => {
+  start(id, input = {}) { return this.queue(() => this.coordinated('start', id, input, async () => {
     const record = this.find(id);
     if (occupiedStatuses.has(record.status)) throw new ApiError(409, '部署仍在运行或存在未清理进程');
     const hardware = await this.hardware();
@@ -210,9 +266,9 @@ class AgentManager {
     const draft = { ...record, gpuIds }; const gpus = await this.validateResources(draft);
     Object.assign(record, { gpuIds: draft.gpuIds, modelPath: draft.modelPath });
     await this.launch(record, gpus); return publicDeployment(record);
-  }); }
+  })); }
   update(id, input) {
-    return this.queue(async () => {
+    return this.queue(() => this.coordinated('update', id, input, async () => {
       const record = this.find(id); const draft = validateDeployment(input.modelRoot===undefined && record.modelRoot ? {...input,modelRoot:record.modelRoot} : input);
       if (input.operationId && !validId(input.operationId)) throw new ApiError(400, '无效的操作 ID');
       draft.modelPath = await checkedModel(await this.rootFor(draft), draft.modelPath);
@@ -222,12 +278,13 @@ class AgentManager {
       }
       if (this.data.deployments.some((item) => item.id !== id && item.alias === draft.alias)) throw new ApiError(409, '服务别名已存在');
       await this.validateResources(draft, id);
+      if (this.activeReceipt) { this.activeReceipt.effectsStarted = true; await this.persist(); }
       await this.stopInternal(record);
       const gpus = await this.validateResources(draft);
       Object.assign(record, draft, { gpuUuids: draft.gpuIds.map((id) => gpus.find((gpu) => gpu.id === id).uuid), appliedOperationId: input.operationId || null });
       await this.persist(); await this.launch(record, gpus);
       return publicDeployment(record);
-    });
+    }));
   }
   setRoot(root) { return this.queue(async () => { this.data.modelRoot = await checkedRoot(root); await this.persist(); return this.snapshotInternal(); }); }
   async logs(id) {
@@ -258,6 +315,8 @@ export async function createAgent(config, dependencies = {}) {
       if (request.method === 'GET' && url.pathname === '/health') { json(response, { service: 'gpu-monitor-agent', ok: true }); return; }
       requireToken(request, config.token);
       if (request.method === 'GET' && url.pathname === '/api/node') { json(response, await manager.snapshot()); return; }
+      const operation = /^\/api\/operations\/([a-zA-Z0-9_-]{1,80})$/.exec(url.pathname);
+      if (operation && request.method === 'GET') { json(response, manager.operation(operation[1])); return; }
       if (request.method === 'POST' && url.pathname === '/api/directories') { const input = await bodyJson(request); json(response, await manager.browse(input.path)); return; }
       if (request.method === 'PUT' && url.pathname === '/api/model-root') { json(response, await manager.setRoot((await bodyJson(request)).modelRoot)); return; }
       if (request.method === 'POST' && url.pathname === '/api/deployments') { json(response, await manager.create(await bodyJson(request)), 201); return; }
@@ -265,10 +324,10 @@ export async function createAgent(config, dependencies = {}) {
       if (match) {
         const [, id, action] = match;
         if (!action && request.method === 'GET') { json(response, await manager.status(id)); return; }
-        if (!action && request.method === 'DELETE') { await bodyJson(request); json(response, await manager.remove(id)); return; }
+        if (!action && request.method === 'DELETE') { json(response, await manager.remove(id, await bodyJson(request))); return; }
         if (action === 'logs' && request.method === 'GET') { json(response, { logs: await manager.logs(id) }); return; }
-        if (action === 'start' && request.method === 'POST') { json(response, await manager.start(id)); return; }
-        if (action === 'stop' && request.method === 'POST') { json(response, await manager.stop(id)); return; }
+        if (action === 'start' && request.method === 'POST') { json(response, await manager.start(id, await bodyJson(request))); return; }
+        if (action === 'stop' && request.method === 'POST') { json(response, await manager.stop(id, await bodyJson(request))); return; }
         if (!action && request.method === 'PATCH') { json(response, await manager.update(id, await bodyJson(request))); return; }
         if (action?.startsWith('inference/') && request.method === 'POST') {
           if (localInference) throw new ApiError(404, '管理接口不提供推理');

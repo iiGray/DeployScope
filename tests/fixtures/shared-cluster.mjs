@@ -30,12 +30,13 @@ export async function sharedCluster(t, { guardedMutations = false } = {}) {
     return {
       get cookie() { return cookie; },
       request(path, { method = 'GET', body, headers = {} } = {}) {
+        const encoded = body === undefined ? undefined : JSON.stringify(body);
         return new Promise((resolve, reject) => {
-          const req = httpRequest(baseUrl + path, { method, headers: { Host: 'console.test:15173', Origin: origin, 'X-GPU-Console': '1', 'Content-Type': 'application/json', Cookie: cookie, ...headers } }, res => {
+          const req = httpRequest(baseUrl + path, { method, headers: { Host: 'console.test:15173', Origin: origin, 'X-GPU-Console': '1', 'Content-Type': 'application/json', Cookie: cookie, ...(encoded === undefined ? {} : { 'Content-Length': Buffer.byteLength(encoded) }), ...headers } }, res => {
             if (res.headers['set-cookie']) cookie = res.headers['set-cookie'][0].split(';')[0];
             const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => { const text = Buffer.concat(chunks).toString(); resolve({ status: res.statusCode, headers: res.headers, text: async () => text, json: async () => JSON.parse(text) }); });
           });
-          req.on('error', reject); req.end(body === undefined ? undefined : JSON.stringify(body));
+          req.on('error', reject); req.end(encoded);
         });
       },
       login(password = TEST_PASSWORD) { return this.request('/api/session/login', { method: 'POST', body: { password } }); },
