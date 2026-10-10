@@ -139,6 +139,24 @@ test('Agent recovery preserves an uncertain launch reservation instead of silent
   await assert.rejects(agent.manager.stop('dep-uncertain', { operationId: 'another-stop' }), { status: 409 });
 });
 
+test('an interrupted update before launch resumes its restart rather than confirming a stopped configuration', async t => {
+  const f = await fixtureDirectory(t);
+  const config = { id: 'test-node', token: 'update-recovery-secret', modelRoot: f.models, stateDir: join(f.directory, 'agent'), coordinatedWrites: true, vllmExecutable: process.execPath, vllmPrefixArgs: [fixtureExecutable], pollMs: 40 };
+  const agent = await createAgent(config, { readGpuStatus: telemetry }); f.cleanupWith(agent.close);
+  const dep = await agent.manager.create(draft(f.models, { id: 'dep-update-recovery', operationId: 'op-create-recovery' }));
+  agent.manager.launch = async () => { throw new ApiError(502, 'interrupted before launch'); };
+  const edit = draft(f.models, { alias: 'updated', operationId: 'op-update-recovery' });
+  await assert.rejects(agent.manager.update(dep.id, edit), /interrupted before launch/);
+  await agent.close();
+  const restored = await createAgent(config, { readGpuStatus: telemetry }); f.cleanupWith(restored.close);
+  const result = await restored.manager.update(dep.id, edit);
+  assert.ok(Number.isInteger(result.pid) && result.pid > 1, 'replay must actually restart the model');
+  assert.equal(result.alias, 'updated');
+  assert.equal(restored.manager.operation('op-update-recovery').status, 'confirmed');
+  await waitFor(async () => (await restored.manager.status(dep.id)).status === 'running');
+  assert.equal((await restored.manager.update(dep.id, edit)).pid, result.pid);
+});
+
 test('a live process group retains GPU ownership when its main process exits', async t => {
   const f = await fixtureDirectory(t);
   const agent = await createAgent({ id: 'test-node', token: 'group-agent-secret', modelRoot: f.models, stateDir: join(f.directory, 'agent'), coordinatedWrites: true, vllmExecutable: process.execPath, vllmPrefixArgs: [fixtureExecutable, '--test-group-child'], pollMs: 40 }, { readGpuStatus: telemetry }); f.cleanupWith(agent.close);

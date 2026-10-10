@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createApi, emptyState, sharedState, readRuntime } from '../src/api.mjs';
 import { listen } from './fixtures/helpers.mjs';
+import { createMutationIntent, mutationBody } from '../src/mutation.mjs';
 
 test('real mode starts empty and shared state never falls back to demo machines', () => {
   assert.deepEqual(emptyState().nodes, []);
@@ -22,6 +23,27 @@ test('frontend client sends the local console header and displays backend errors
   const api = createApi(await listen(server));
   assert.equal((await api('/state')).ok, true);
   await assert.rejects(api('/failure', { method: 'POST', body: {} }), { message: 'GPU occupied', status: 409 });
+});
+
+test('a truncated successful response is uncertain and replay keeps the original request identity', async t => {
+  const bodies = [];
+  const server = createServer(async (req, res) => {
+    let input = ''; for await (const chunk of req) input += chunk;
+    bodies.push(JSON.parse(input));
+    res.setHeader('Content-Type', 'application/json');
+    if (bodies.length === 1) {
+      res.writeHead(200, { 'Content-Length': '100' }); res.flushHeaders(); res.write('{"id":');
+      setTimeout(() => res.destroy(), 20);
+    } else res.end('{"id":"same-deployment"}');
+  });
+  t.after(() => { server.closeAllConnections(); return new Promise(r => server.close(r)); });
+  const client = createApi(await listen(server));
+  const frozen = createMutationIntent({ kind: 'start', id: 'same-deployment', revision: 2, shared: true }, 'original-request');
+  let failure; try { await client('/start', { method: 'POST', body: mutationBody(frozen) }); } catch (cause) { failure = cause; }
+  assert.equal(failure?.status, 0, 'unreadable success is not a definitive server rejection');
+  assert.equal(!failure.status || failure.status >= 500, true, 'UI retains this frozen retry');
+  assert.equal((await client('/start', { method: 'POST', body: mutationBody(frozen) })).id, 'same-deployment');
+  assert.deepEqual(bodies[1], bodies[0]); assert.equal(bodies[1].requestId, 'original-request'); assert.equal(bodies[1].expectedRevision, 2);
 });
 
 test('selected log errors preserve a successfully loaded shared cluster snapshot', async (t) => {

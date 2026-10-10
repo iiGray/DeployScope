@@ -7,7 +7,7 @@ export function createApi(baseUrl = '') {
     try { response = await fetch(baseUrl + path, { method, headers: { 'X-GPU-Console': '1', ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', signal: AbortSignal.timeout(65000) }); }
     catch { throw new ApiRequestError('网页服务连接失败或请求超时，请检查服务是否运行'); }
     let result;
-    try { result = await response.json(); } catch { throw new ApiRequestError('后台返回了无效响应', response.status); }
+    try { result = await response.json(); } catch { throw new ApiRequestError('后台响应未完整读取，操作结果尚未确认', response.ok ? 0 : response.status); }
     if (!response.ok) throw new ApiRequestError(result.error?.message || `请求失败 (${response.status})`, response.status);
     return result;
   };

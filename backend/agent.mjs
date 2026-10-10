@@ -272,7 +272,7 @@ class AgentManager {
       const record = this.find(id); const draft = validateDeployment(input.modelRoot===undefined && record.modelRoot ? {...input,modelRoot:record.modelRoot} : input);
       if (input.operationId && !validId(input.operationId)) throw new ApiError(400, '无效的操作 ID');
       draft.modelPath = await checkedModel(await this.rootFor(draft), draft.modelPath);
-      if (input.operationId && record.appliedOperationId === input.operationId) {
+      if (!this.config.coordinatedWrites && input.operationId && record.appliedOperationId === input.operationId) {
         if (!Object.keys(draft).every((key) => JSON.stringify(draft[key]) === JSON.stringify(record[key]))) throw new ApiError(409, '该操作 ID 已用于另一份配置');
         return publicDeployment(record);
       }
@@ -281,7 +281,9 @@ class AgentManager {
       if (this.activeReceipt) { this.activeReceipt.effectsStarted = true; await this.persist(); }
       await this.stopInternal(record);
       const gpus = await this.validateResources(draft);
-      Object.assign(record, draft, { gpuUuids: draft.gpuIds.map((id) => gpus.find((gpu) => gpu.id === id).uuid), appliedOperationId: input.operationId || null });
+      Object.assign(record, draft, { gpuUuids: draft.gpuIds.map((id) => gpus.find((gpu) => gpu.id === id).uuid) });
+      // Shared mutations are complete only at the durable launch/result checkpoint.
+      if (!this.config.coordinatedWrites) record.appliedOperationId = input.operationId || null;
       await this.persist(); await this.launch(record, gpus);
       return publicDeployment(record);
     }));
