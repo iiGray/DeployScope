@@ -12,12 +12,21 @@ export function createApi(baseUrl = '') {
   };
 }
 export const api = createApi();
-export async function readRuntime(client, selectedId) {
+export function selectLogService(snapshot, selectedId, nodeId = snapshot.nodes[0]?.id) {
+  const services = snapshot.services || [];
+  if (services.some(service => service.id === selectedId)) return selectedId;
+  const priority = { running: 0, starting: 1, restarting: 1, stopping: 2 };
+  return services.filter(service => service.nodeId === nodeId)
+    .sort((a, b) => (priority[a.status] ?? 3) - (priority[b.status] ?? 3)
+      || (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0))[0]?.id || null;
+}
+export async function readRuntime(client, selectedId, nodeId) {
   const snapshot = await client('/api/control/state');
+  selectedId = selectLogService(snapshot, selectedId, nodeId);
   let logs = null; let logError = null;
   if (selectedId) {
     try { logs = (await client(`/api/control/deployments/${selectedId}/logs`)).logs; }
     catch (cause) { logError = cause.message; }
   }
-  return { snapshot, logs, logError };
+  return { snapshot, selectedId, logs, logError };
 }

@@ -122,6 +122,11 @@ export function escapeHtml(value) {
   })[character]);
 }
 
+export function renderAliasCopyButton(item) {
+  if (!item || typeof item.id!=='string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(item.id) || typeof item.alias!=='string' || !item.alias) return '';
+  return `<button class="alias-copy-button" data-copy-alias="${escapeHtml(item.id)}" aria-label="复制服务别名 ${escapeHtml(item.alias)}" title="复制 model 字段：${escapeHtml(item.alias)}"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button>`;
+}
+
 export function createInitialState() {
   return {
     nodes: clone(initialNodes),
@@ -246,6 +251,37 @@ export function stopDeployment(state, deploymentId) {
   deployment.status = 'stopped';
   deployment.requestsPerMinute = 0;
   deployment.updatedAt = '刚刚';
+  return next;
+}
+
+export function renderLogOptions(services, selectedId, statusLabels = {}) {
+  const placeholder = selectedId ? '' : `<option value="" selected>${services.length ? '选择日志服务' : '暂无部署服务'}</option>`;
+  return placeholder + services.map(item => `<option value="${escapeHtml(item.id)}"${item.id === selectedId ? ' selected' : ''}>${escapeHtml(item.alias)} · ${escapeHtml(statusLabels[item.status] || item.status || '—')}</option>`).join('');
+}
+
+export function renderModelIssue(error) {
+  return error ? `<p class="model-error" role="alert">模型扫描失败：${escapeHtml(error)}</p>` : '';
+}
+
+const deletable = item => item?.status === 'stopped' && typeof item.id === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(item.id);
+
+export function renderDeleteButton(item, busy = false) {
+  if (!deletable(item)) return '';
+  return `<button class="tiny-button delete-text" data-delete="${escapeHtml(item.id)}" ${busy ? 'disabled' : ''}>${item.deletePending ? '重试删除' : '删除'}</button>`;
+}
+
+export function renderDeleteDialog(item) {
+  if (!deletable(item)) return '';
+  return `<section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title"><h2 id="delete-title">删除 ${escapeHtml(item.alias)}？</h2><p>确认后将从服务列表和统一 API 中移除此部署，服务别名可以重新使用。<br/>不会删除模型文件或日志；历史配置在服务器端归档。</p><div><button class="button secondary" data-action="cancel-delete">取消</button><button class="button stop-button" data-confirm-delete="${escapeHtml(item.id)}">确认删除</button></div></section>`;
+}
+
+export function deleteDeployment(state, id) {
+  const item = state.deployments.find(deployment => deployment.id === id);
+  if (!item) throw new Error('部署不存在');
+  if (!deletable(item)) throw new Error('只能删除已停止的部署');
+  const next = clone(state);
+  next.deployments = next.deployments.filter(deployment => deployment.id !== id);
+  (next.deletedDeployments ||= []).push({ ...clone(item), deletedAt: new Date().toISOString() });
   return next;
 }
 

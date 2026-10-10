@@ -9,7 +9,7 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ApiError, serialQueue, readJson, writeJson, instanceLock, birthTime, bootId, pidAlive, requireToken, bodyJson, json, fail, relay } from './common.mjs';
 import { readGpuStatus, validateDeployment, vllmLaunch } from './gpu.mjs';
-import { checkedRoot, checkedModel, scanModels } from './models.mjs';
+import { checkedRoot, checkedModel, checkedDirectory, listDirectories, scanModels } from './models.mjs';
 
 const occupiedStatuses = new Set(['starting', 'running', 'stopping', 'orphaned']);
 const validId = (id) => /^[a-zA-Z0-9_-]{1,80}$/.test(id);
@@ -79,12 +79,18 @@ class AgentManager {
     let gpus = []; let gpuError = null; let models = []; let modelError = null;
     try { gpus = (await this.hardware()).gpus; } catch (cause) { gpuError = cause.message; }
     try { models = await scanModels(this.data.modelRoot); } catch (cause) { modelError = cause.message; }
-    return { id: this.config.id, name: this.config.name || this.config.id, host: this.config.hostName || this.config.name || this.config.id, status: 'online', heartbeat: '刚刚', driver: gpus[0]?.driver || '—', modelRoot: this.data.modelRoot, models, gpus, gpuError, modelError, deployments: this.data.deployments.map(publicDeployment) };
+    return { id: this.config.id, name: this.config.name || this.config.id, host: this.config.hostName || this.config.name || this.config.id, status: 'online', heartbeat: '刚刚', driver: gpus[0]?.driver || '—', modelRoot: this.data.modelRoot, defaultModelRoot: this.config.defaultModelRoot || '/data/hf_models', modelBrowseRoot:this.config.modelBrowseRoot || '/data', models, gpus, gpuError, modelError, deployments: this.data.deployments.map(publicDeployment) };
   }
   snapshot() { return this.queue(() => this.snapshotInternal()); }
   status(id) { return this.queue(async () => { const record = this.find(id); await this.refresh([record]); return publicDeployment(record); }); }
+  browse(path = this.config.defaultModelRoot || '/data/hf_models') { return listDirectories(this.config.modelBrowseRoot || '/data',path); }
+  async rootFor(draft) {
+    if (draft.modelRoot === undefined) return this.data.modelRoot;
+    draft.modelRoot = await checkedDirectory(this.config.modelBrowseRoot || '/data',draft.modelRoot);
+    return draft.modelRoot;
+  }
   async validateResources(draft, editingId = null) {
-    draft.modelPath = await checkedModel(this.data.modelRoot, draft.modelPath);
+    draft.modelPath = await checkedModel(await this.rootFor(draft), draft.modelPath);
     const { gpus } = await this.hardware();
     for (const id of draft.gpuIds) {
       const gpu = gpus.find((item) => item.id === id);
@@ -101,6 +107,7 @@ class AgentManager {
       const draft = validateDeployment(input);
       const id = input.id || `dep-${randomUUID()}`;
       if (!validId(id)) throw new ApiError(400, '无效部署 ID');
+      if (this.data.deletedDeployments?.some(record => record.id === id)) throw new ApiError(409, '该部署已删除，请新建部署');
       const existing = this.data.deployments.find((record) => record.id === id);
       if (existing) {
         if (Object.keys(draft).every((key) => JSON.stringify(draft[key]) === JSON.stringify(existing[key]))) return publicDeployment(existing);
@@ -164,6 +171,23 @@ class AgentManager {
     await this.persist();
   }
   stop(id) { return this.queue(async () => { const record = this.find(id); await this.stopInternal(record); return publicDeployment(record); }); }
+  remove(id) {
+    return this.queue(async () => {
+      if (this.closed) throw new ApiError(503, 'Agent 正在停止');
+      const record = this.data.deployments.find(item => item.id === id);
+      if (!record) {
+        if (this.data.deletedDeployments?.some(item => item.id === id)) return { id, deleted: true };
+        throw new ApiError(404, '部署不存在');
+      }
+      if (record.status !== 'stopped') throw new ApiError(409, '只能删除已停止的部署，请先停止服务');
+      if (pidAlive(record.pid) || groupAlive(record.pid) || this.owned.has(id)) throw new ApiError(409, '部署仍有进程，无法删除，请先检查并停止服务');
+      const next = structuredClone(this.data);
+      next.deployments = next.deployments.filter(item => item.id !== id);
+      (next.deletedDeployments ||= []).push({ ...structuredClone(record), deletedAt: new Date().toISOString() });
+      await writeJson(this.file, next); this.data = next;
+      return { id, deleted: true };
+    });
+  }
   start(id) { return this.queue(async () => {
     const record = this.find(id);
     if (occupiedStatuses.has(record.status)) throw new ApiError(409, '部署仍在运行或存在未清理进程');
@@ -176,9 +200,9 @@ class AgentManager {
   }); }
   update(id, input) {
     return this.queue(async () => {
-      const record = this.find(id); const draft = validateDeployment(input);
+      const record = this.find(id); const draft = validateDeployment(input.modelRoot===undefined && record.modelRoot ? {...input,modelRoot:record.modelRoot} : input);
       if (input.operationId && !validId(input.operationId)) throw new ApiError(400, '无效的操作 ID');
-      draft.modelPath = await checkedModel(this.data.modelRoot, draft.modelPath);
+      draft.modelPath = await checkedModel(await this.rootFor(draft), draft.modelPath);
       if (input.operationId && record.appliedOperationId === input.operationId) {
         if (!Object.keys(draft).every((key) => JSON.stringify(draft[key]) === JSON.stringify(record[key]))) throw new ApiError(409, '该操作 ID 已用于另一份配置');
         return publicDeployment(record);
@@ -219,12 +243,14 @@ export async function createAgent(config, dependencies = {}) {
       if (request.method === 'GET' && url.pathname === '/health') { json(response, { service: 'gpu-monitor-agent', ok: true }); return; }
       requireToken(request, config.token);
       if (request.method === 'GET' && url.pathname === '/api/node') { json(response, await manager.snapshot()); return; }
+      if (request.method === 'POST' && url.pathname === '/api/directories') { const input = await bodyJson(request); json(response, await manager.browse(input.path)); return; }
       if (request.method === 'PUT' && url.pathname === '/api/model-root') { json(response, await manager.setRoot((await bodyJson(request)).modelRoot)); return; }
       if (request.method === 'POST' && url.pathname === '/api/deployments') { json(response, await manager.create(await bodyJson(request)), 201); return; }
       const match = /^\/api\/deployments\/([a-zA-Z0-9_-]{1,80})(?:\/(start|stop|logs|inference\/(?:chat\/completions|completions)))?$/.exec(url.pathname);
       if (match) {
         const [, id, action] = match;
         if (!action && request.method === 'GET') { json(response, await manager.status(id)); return; }
+        if (!action && request.method === 'DELETE') { await bodyJson(request); json(response, await manager.remove(id)); return; }
         if (action === 'logs' && request.method === 'GET') { json(response, { logs: await manager.logs(id) }); return; }
         if (action === 'start' && request.method === 'POST') { json(response, await manager.start(id)); return; }
         if (action === 'stop' && request.method === 'POST') { json(response, await manager.stop(id)); return; }

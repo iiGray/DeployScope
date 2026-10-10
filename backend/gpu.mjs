@@ -42,7 +42,8 @@ export function validateDeployment(input) {
   if (!Number.isInteger(maxModelLen) || maxModelLen < 1 || maxModelLen > 1048576) throw new ApiError(400, '上下文长度必须为 1–1048576');
   if (!Number.isFinite(gpuMemoryUtilization) || gpuMemoryUtilization < 0.5 || gpuMemoryUtilization > 0.98) throw new ApiError(400, '显存比例必须为 0.50–0.98');
   if (!['auto', 'bfloat16', 'float16'].includes(dtype)) throw new ApiError(400, '不支持此计算精度');
-  return { alias, modelPath: input.modelPath, gpuIds: [...gpuIds], maxModelLen, gpuMemoryUtilization, dtype, tensorParallelSize: gpuIds.length };
+  if (input.modelRoot !== undefined && (typeof input.modelRoot !== 'string' || !isAbsolute(input.modelRoot))) throw new ApiError(400, '模型目录必须是绝对路径');
+  return { alias, modelPath: input.modelPath, ...(input.modelRoot !== undefined ? { modelRoot:input.modelRoot } : {}), gpuIds: [...gpuIds], maxModelLen, gpuMemoryUtilization, dtype, tensorParallelSize: gpuIds.length };
 }
 export function vllmLaunch(draft, gpus, port, apiKey) {
   return {

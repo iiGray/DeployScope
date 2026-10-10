@@ -5,7 +5,7 @@ import { resolve, extname } from 'node:path';
 import { ApiError, readJson, writeJson, serialQueue, httpUrl, bodyJson, json, fail, remoteJson } from './common.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const assets = new Set(['/index.html', '/favicon.svg', '/src/app.mjs', '/src/app-state.mjs', '/src/command.mjs', '/src/styles.css', '/src/api.mjs']);
+const assets = new Set(['/index.html', '/favicon.svg', '/src/app.mjs', '/src/app-state.mjs', '/src/model-browser.mjs', '/src/command.mjs', '/src/styles.css', '/src/api.mjs']);
 const types = { '.html': 'text/html', '.css': 'text/css', '.mjs': 'text/javascript', '.svg': 'image/svg+xml' };
 
 export async function createConsole(config) {
@@ -37,8 +37,9 @@ export async function createConsole(config) {
         if (path.startsWith('/api/control/')) {
           if (!settings.controllerUrl || !settings.adminToken) throw new ApiError(503, '请先在连接设置中配置共享控制节点');
           const remotePath = '/api/' + path.slice('/api/control/'.length);
-          if (!/^\/api\/(state|nodes(?:\/[a-zA-Z0-9_-]{1,80}\/(?:connect|model-root))?|deployments(?:\/[a-zA-Z0-9_-]{1,80}(?:\/(?:start|stop|logs))?)?)$/.test(remotePath)) throw new ApiError(404, '接口不存在');
-          if (!['GET', 'POST', 'PUT', 'PATCH'].includes(request.method)) throw new ApiError(405, '请求方法不支持');
+          if (!/^\/api\/(state|nodes(?:\/[a-zA-Z0-9_-]{1,80}\/(?:connect|model-root|directories))?|deployments(?:\/[a-zA-Z0-9_-]{1,80}(?:\/(?:start|stop|logs))?)?)$/.test(remotePath)) throw new ApiError(404, '接口不存在');
+          if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) throw new ApiError(405, '请求方法不支持');
+          if (request.method === 'DELETE' && !/^\/api\/deployments\/[a-zA-Z0-9_-]{1,80}$/.test(remotePath)) throw new ApiError(405, '只允许删除部署记录');
           const body = request.method === 'GET' ? undefined : await bodyJson(request);
           const result = await remoteJson(httpUrl(settings.controllerUrl) + remotePath, settings.adminToken, { method: request.method, body, timeout: 60000 });
           json(response, result, request.method === 'POST' && remotePath === '/api/deployments' ? 201 : 200); return;

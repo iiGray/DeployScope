@@ -1,6 +1,7 @@
-import { createInitialState, createDeployment, updateDeployment, startDeployment, stopDeployment, validateDraft, escapeHtml as esc } from './app-state.mjs';
+import { createInitialState, createDeployment, updateDeployment, startDeployment, stopDeployment, deleteDeployment, validateDraft, renderLogOptions, renderModelIssue, renderDeleteButton, renderDeleteDialog, renderAliasCopyButton, escapeHtml as esc } from './app-state.mjs';
 import { buildCommand } from './command.mjs';
-import { api, emptyState, sharedState, readRuntime } from './api.mjs';
+import { api, emptyState, sharedState, readRuntime, selectLogService } from './api.mjs';
+import { DEFAULT_MODEL_ROOT, createDirectoryReader, renderDirectoryDialog, renderModelOptions } from './model-browser.mjs';
 
 const STORE = 'gpu-monitor-preview-v1';
 const demo = new URLSearchParams(location.search).get('demo') === '1';
@@ -23,8 +24,27 @@ let polling = false;
 let rawLog = '';
 let lastRawLog = '';
 let controlError = '';
+let activeView = 'deploy';
+let logState = 'idle';
+let runtimeLogError = '';
+let directorySnapshot = null;
+let directoryLoading = false;
+let directoryIssue = '';
+let directoryPicker = null;
+let rootDraft = DEFAULT_MODEL_ROOT;
 let draft = newDraft();
-let rootDraft = state.nodes[0]?.modelRoot || '';
+const directoryReader = createDirectoryReader(async (path, options) => {
+  if (!demo) return api(path, options);
+  const machine = state.nodes.find(n => n.id === decodeURIComponent(path.split('/')[4]));
+  const requested = options.body.path || DEFAULT_MODEL_ROOT;
+  const directories = new Set(['/', DEFAULT_MODEL_ROOT]);
+  for (const full of [...(machine?.models || []).map(m => m.path), ...(machine?.models || []).map(m => `${DEFAULT_MODEL_ROOT}/${m.alias}`), DEFAULT_MODEL_ROOT]) {
+    let parent = ''; for (const part of full.split('/').filter(Boolean)) { parent += '/' + part; directories.add(parent); }
+  }
+  const parentOf = value => value.slice(0, value.lastIndexOf('/')) || '/';
+  if (!directories.has(requested)) throw new Error('演示目录不存在');
+  return { root:'/', path:requested, parent:requested==='/' ? null : parentOf(requested), children:[...directories].filter(p => p!=='/' && parentOf(p)===requested).sort().map(p => ({name:p.split('/').at(-1),path:p})) };
+});
 let logs = [{ time: 'READY', message: '选择机器并连接，查看 GPU 状态。', type: 'muted' }];
 
 const paths = {
@@ -53,7 +73,7 @@ const available = (gpu) => !gpu.externalBusy && (!gpu.deploymentId || gpu.deploy
 
 function newDraft() {
   const machine = state.nodes.find((item) => item.id === machineId);
-  return { alias: '', nodeId: machineId, modelPath: machine?.models[0]?.path || '', gpuIds: [], maxModelLen: 32768, gpuMemoryUtilization: 0.9, dtype: 'auto' };
+  return { alias: '', nodeId: machineId, modelRoot:rootDraft || machine?.defaultModelRoot || DEFAULT_MODEL_ROOT, modelPath: directorySnapshot?.nodeId===machineId ? directorySnapshot.children[0]?.path || '' : '', gpuIds: [], maxModelLen: 32768, gpuMemoryUtilization: 0.9, dtype: 'auto' };
 }
 function save() {
   if (!demo) return;
@@ -92,39 +112,56 @@ function serviceRows() {
   return state.deployments.map((item) => {
     const machine = state.nodes.find((candidate) => candidate.id === item.nodeId);
     const restartable = ['stopped', 'failed', 'unknown'].includes(item.status);
-    return `<tr class="${selectedId === item.id ? 'selected-row' : ''}"><td><button class="service-name" data-select="${item.id}" title="选中服务查看日志">${esc(item.alias)}</button><small>${esc(item.modelPath.split('/').at(-1))}</small></td><td title="${esc(item.error || '')}">${status(item.status)}</td><td><span>${esc(machine?.name || '未知机器')}</span><small>GPU ${item.gpuIds.join(', ')} · TP ${item.tensorParallelSize}</small></td><td class="service-actions"><button class="tiny-button" data-edit="${item.id}" ${busy ? 'disabled' : ''}>${icon('edit')}修改</button><button class="tiny-button ${restartable ? '' : 'stop-text'}" data-${restartable ? 'start' : 'stop'}="${item.id}" ${busy ? 'disabled' : ''}>${icon(restartable ? 'play' : 'stop')}${restartable ? '启动' : '停止'}</button></td></tr>`;
+    const blocked = busy || item.deletePending;
+    return `<tr class="${selectedId === item.id ? 'selected-row' : ''}"><td><div class="service-name-line"><button class="service-name" data-select="${esc(item.id)}" title="选中服务查看日志">${esc(item.alias)}</button>${renderAliasCopyButton(item)}</div><small>${esc(item.modelPath.split('/').at(-1))}</small></td><td title="${esc(item.error || '')}">${status(item.status)}</td><td><span>${esc(machine?.name || '未知机器')}</span><small>GPU ${item.gpuIds.join(', ')} · TP ${item.tensorParallelSize}</small></td><td class="service-actions"><button class="tiny-button" data-edit="${esc(item.id)}" ${blocked ? 'disabled' : ''}>${icon('edit')}修改</button><button class="tiny-button ${restartable ? '' : 'stop-text'}" data-${restartable ? 'start' : 'stop'}="${esc(item.id)}" ${blocked ? 'disabled' : ''}>${icon(restartable ? 'play' : 'stop')}${restartable ? '启动' : '停止'}</button>${renderDeleteButton(item, busy)}</td></tr>`;
   }).join('');
+}
+
+function logOptions() {
+  return renderLogOptions(state.deployments, selectedId, labels);
+}
+
+function selectService(id, view = activeView) {
+  selectedId = id; rawLog = ''; lastRawLog = ''; runtimeLogError = ''; logState = id ? 'loading' : 'idle'; activeView = view;
+  render(); if (!demo) poll();
 }
 
 function render() {
   const machine = node();
   const selected = deployment(selectedId);
-  document.querySelector('#app').innerHTML = `<main class="console">
+  document.querySelector('#app').innerHTML = `<main class="console" data-view="${activeView}">
     <header class="app-header"><div class="app-brand">${icon('gpu')}<h1>GPU Monitor</h1><span class="header-divider"></span><span class="header-label">推理部署</span></div><div class="header-tools"><a class="text-button" href="${demo ? '/' : '/?demo=1'}">${demo ? '真实模式' : '演示'}</a><span class="preview-label"><i></i>${demo ? '前端演示' : '共享控制节点'}</span>${demo ? '' : `<button class="icon-button" data-action="settings" aria-label="连接设置" title="连接设置">${icon('settings')}</button>`}</div></header>
+    <nav class="workspace-tabs" aria-label="工作区切换">${[['deploy', '部署'], ['gpus', '显卡'], ['logs', '日志'], ['services', '服务']].map(([view, title]) => `<button data-view="${view}" aria-pressed="${activeView === view}">${title}</button>`).join('')}</nav>
     <div class="console-grid">
       <div class="config-column">
-        <section class="panel connection-panel"><div class="panel-title">${icon('server')}<h2>机器连接</h2><span class="connection-state ${connected() ? 'online' : ''}"><i></i>${connecting ? '连接中…' : connected() ? demo ? '已连接 · 模拟' : '已连接' : '未连接'}</span></div><div class="connection-fields"><label class="grow">机器<select id="machine" aria-label="机器" ${connecting || busy || editingId ? 'disabled' : ''}>${!state.nodes.length ? '<option>请先在连接设置中添加机器</option>' : state.nodes.map((item) => `<option value="${esc(item.id)}" ${machineId === item.id ? 'selected' : ''}>${esc(item.name)} · ${esc(item.host)}</option>`).join('')}</select></label><button class="button ${connected() ? 'secondary' : 'primary'} connect-button" data-action="connect" ${connecting || busy || !machineId ? 'disabled' : ''}>${icon(connected() ? 'refresh' : 'link')}${connecting ? '连接中' : connected() ? '重新连接' : '连接机器'}</button></div></section>
-        <section class="panel model-panel"><div class="panel-title">${icon('folder')}<h2>模型</h2>${editingId ? '<span class="editing-tag">修改部署</span><button class="text-button" data-action="clear-form">取消修改</button>' : ''}</div><label>模型目录<div class="directory-field"><input id="model-root" value="${esc(rootDraft)}" placeholder="/data/models" aria-label="模型目录"/><button class="icon-button" data-action="apply-directory" aria-label="保存模型目录" title="保存模型目录">${icon('check')}</button></div></label><div class="model-fields"><label class="model-path-field">模型路径<input id="model-path" list="available-models" value="${esc(draft.modelPath)}" placeholder="选择或输入远端模型路径" aria-label="模型路径"/><datalist id="available-models">${machine.models.map((model) => `<option value="${esc(model.path)}">${esc(model.alias)}</option>`).join('')}</datalist></label><label class="alias-field">服务别名<input id="service-alias" value="${esc(draft.alias)}" placeholder="例如 qwen-32b" aria-label="服务别名"/></label></div><p class="field-note">通过统一 API 的 <code>model</code> 字段调用此别名。</p></section>
+        <section class="panel connection-panel"><h2 class="sr-only">机器连接</h2><div class="connection-fields"><label class="grow"><span class="sr-only">机器</span><select id="machine" aria-label="机器" ${connecting || busy || editingId ? 'disabled' : ''}>${!state.nodes.length ? '<option>请先添加机器</option>' : state.nodes.map((item) => `<option value="${esc(item.id)}" ${machineId === item.id ? 'selected' : ''}>${esc(item.name)}</option>`).join('')}</select></label><span class="connection-state ${connected() ? 'online' : ''}"><i></i>${connecting ? '连接中' : connected() ? demo ? '已连接 · 模拟' : '已连接' : '未连接'}</span><button class="button ${connected() ? 'secondary' : 'primary'} connect-button" data-action="connect" ${connecting || busy || !machineId ? 'disabled' : ''}>${icon(connected() ? 'refresh' : 'link')}${connecting ? '连接中' : connected() ? '重新连接' : '连接机器'}</button></div></section>
+        <section class="panel model-panel"><div class="panel-title">${icon('folder')}<h2>模型</h2>${editingId ? '<span class="editing-tag">修改部署</span><button class="text-button" data-action="clear-form">取消修改</button>' : ''}</div><label>模型目录<button id="model-root" class="directory-picker-button" data-action="browse-directory" aria-label="选择模型目录" title="${esc(rootDraft)}" ${!connected() || connecting || busy || directoryLoading ? 'disabled' : ''}>${icon('folder')}<span>${esc(rootDraft)}</span>${icon('down')}</button></label><div class="model-fields"><label class="model-path-field">模型路径<select id="model-path" aria-label="模型路径" ${!connected() || directoryLoading || busy ? 'disabled' : ''}>${renderModelOptions(directorySnapshot?.nodeId===machineId ? directorySnapshot.children : [],draft.modelPath,!!editingId)}</select></label><label class="alias-field">服务别名<input id="service-alias" value="${esc(draft.alias)}" placeholder="例如 qwen-32b" aria-label="服务别名"/></label></div></section>
         <section class="panel gpu-select-panel"><div class="panel-title">${icon('gpu')}<h2>GPU 选择</h2><span class="section-meta">独占分配</span>${connected() ? `<button class="text-button" data-action="toggle-gpus">${draft.gpuIds.length ? '取消全选' : '选择空闲'}</button>` : ''}</div>${gpuChoices()}<div class="selection-footer"><span>已选 <strong>${draft.gpuIds.length}</strong> 张 GPU</span><span>Tensor Parallel <strong>${draft.gpuIds.length || '—'}</strong></span></div></section>
-        <details class="panel params-panel" open><summary>${icon('settings')}<h2>vLLM 参数</h2><span class="section-meta">引擎 vLLM</span>${icon('down')}</summary><div class="parameter-fields"><label>最大上下文<select id="max-model-len" aria-label="最大上下文">${[8192, 16384, 32768, 65536, 131072].map((value) => `<option value="${value}" ${Number(draft.maxModelLen) === value ? 'selected' : ''}>${value.toLocaleString()}</option>`).join('')}</select></label><label>显存比例<input id="gpu-memory" type="number" min="0.5" max="0.98" step="0.01" value="${draft.gpuMemoryUtilization}" aria-label="显存比例"/></label><label>精度<select id="model-dtype" aria-label="精度">${['auto', 'bfloat16', 'float16'].map((value) => `<option ${draft.dtype === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div></details>
+        <details class="panel params-panel" open><summary>${icon('settings')}<h2>vLLM 参数</h2>${icon('down')}</summary><div class="parameter-fields"><label>最大上下文<select id="max-model-len" aria-label="最大上下文">${[...new Set([4096, 8192, 16384, 32768, 65536, 131072, Number(draft.maxModelLen)])].sort((a, b) => a - b).map((value) => `<option value="${value}" ${Number(draft.maxModelLen) === value ? 'selected' : ''}>${value.toLocaleString()}</option>`).join('')}</select></label><label>显存比例<input id="gpu-memory" type="number" min="0.5" max="0.98" step="0.01" value="${draft.gpuMemoryUtilization}" aria-label="显存比例"/></label><label>精度<select id="model-dtype" aria-label="精度">${['auto', 'bfloat16', 'float16'].map((value) => `<option ${draft.dtype === value ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div></details>
+        <section class="action-panel"><button class="button primary deploy-button" data-action="deploy" ${connected() && !connecting && !busy && !machine.gpuError && machine.gpus.length && !deployment(editingId)?.deletePending ? '' : 'disabled'}>${icon(editingId ? 'refresh' : 'play')}${busy ? '处理中…' : editingId ? '保存并重启部署' : '启动部署'}</button><div class="action-row"><button class="button stop-button" data-action="stop-selected" ${selected && selected.status !== 'stopped' && !selected.deletePending && !busy ? '' : 'disabled'}>${icon('stop')}停止${selected ? '选中服务' : ''}</button><button class="button secondary" data-action="clear-form" ${busy ? 'disabled' : ''}>${icon('clear')}清空</button><button class="button secondary" data-action="copy-command">${icon('copy')}复制命令</button></div><div id="error-box" class="form-error" role="alert" ${error ? '' : 'hidden'}>${esc(error)}</div></section>
+        <details class="panel command-panel" ${commandOpen ? 'open' : ''}><summary>${icon('terminal')}<h2>启动命令</h2>${icon('down')}</summary><pre id="command-text">${esc(buildCommand(draft))}</pre></details>
       </div>
       <div class="runtime-column">
-        <section class="action-panel"><button class="button primary deploy-button" data-action="deploy" ${connected() && !connecting && !busy && !machine.gpuError && machine.gpus.length ? '' : 'disabled'}>${icon(editingId ? 'refresh' : 'play')}${busy ? '处理中…' : editingId ? '保存并重启部署' : '启动部署'}</button><div class="action-row"><button class="button stop-button" data-action="stop-selected" ${selected && selected.status !== 'stopped' && !busy ? '' : 'disabled'}>${icon('stop')}停止${selected ? '选中服务' : ''}</button><button class="button secondary" data-action="clear-form" ${busy ? 'disabled' : ''}>${icon('clear')}清空</button><button class="button secondary" data-action="copy-command">${icon('copy')}复制命令</button></div><div id="error-box" class="form-error" role="alert" ${error ? '' : 'hidden'}>${esc(error)}</div></section>
-        <details class="panel command-panel" ${commandOpen ? 'open' : ''}><summary>${icon('terminal')}<h2>启动命令</h2>${icon('down')}</summary><pre id="command-text">${esc(buildCommand(draft))}</pre></details>
-        <section class="log-panel"><div class="panel-title">${icon('terminal')}<h2>部署日志</h2><button class="text-button" data-action="clear-log">清空显示</button></div><div class="terminal" role="log" aria-label="部署日志" aria-live="polite">${terminalContent()}</div></section>
+        <section class="panel log-panel"><div class="panel-title">${icon('terminal')}<h2>vLLM 日志</h2><span class="log-indicator">${demo ? '演示' : runtimeLogError ? '读取失败' : selected ? '每 3 秒同步' : '等待部署'}</span><button class="text-button" data-action="refresh-log">刷新</button><button class="text-button" data-action="clear-log">清空显示</button></div><label class="log-picker"><span class="sr-only">日志服务</span><select id="log-service" aria-label="日志服务" ${state.deployments.length ? '' : 'disabled'}>${logOptions()}</select></label><div class="terminal" role="log" aria-label="部署日志" aria-live="off">${terminalContent()}</div></section>
         <section class="panel gpu-status-panel"><div class="panel-title">${icon('gpu')}<h2>显卡状态</h2>${connected() ? `<span class="section-meta">${machine.gpus.length} 张</span><button class="icon-button" data-action="refresh-gpus" aria-label="刷新显卡状态" title="刷新状态">${icon('refresh')}</button>` : ''}</div>${gpuStatus()}</section>
       </div>
     </div>
     <section class="panel services-panel"><div class="panel-title">${icon('server')}<h2>已部署服务</h2><span class="section-meta">${state.deployments.length} 个</span><div class="api-inline"><span>统一 API</span><code>${esc(state.gateway.baseUrl)}</code><button class="icon-button" data-action="copy-api" aria-label="复制统一 API 地址" title="复制 API 地址">${icon('copy')}</button></div></div><div class="services-table-wrap"><table class="services-table"><thead><tr><th>服务别名 / 模型</th><th>状态</th><th>机器 / GPU</th><th class="align-right">操作</th></tr></thead><tbody>${serviceRows()}</tbody></table></div></section>
-    <footer><span id="control-status"><i class="demo-dot"></i>${demo ? '机器连接、显卡指标与部署日志均为模拟数据。' : esc(controlError || '本地客户端 · 部署状态由共享控制节点同步')}</span><span>vLLM · GPU 独占</span></footer>
+    <footer><span id="control-status"><i class="demo-dot"></i>${demo ? '机器连接、显卡指标与部署日志均为模拟数据。' : esc(controlError || '本地客户端 · 部署状态由共享控制节点同步')}</span><span>vLLM · GPU 独占 · 紧凑 v2</span></footer>
   </main>`;
   document.title = 'GPU Monitor · 推理部署';
+  document.querySelector('.model-panel').insertAdjacentHTML('beforeend', `<div class="model-notice">${renderModelIssue(directoryIssue)}</div>`);
   document.querySelector('.command-panel')?.addEventListener('toggle', (event) => { commandOpen = event.target.open; });
   const terminal = document.querySelector('.terminal');
   terminal.scrollTop = terminal.scrollHeight;
 }
 
 function terminalContent() {
+  if (!demo && selectedId) {
+    if (runtimeLogError) return `<div class="log-empty log-error">${esc(runtimeLogError)}<br/>可点击“刷新”重试；部署状态不受影响。</div>`;
+    if (rawLog) return `<pre class="remote-log">${esc(rawLog)}</pre>`;
+    return `<div class="log-empty">${logState === 'ready' ? 'vLLM 暂无输出，启动后会自动同步日志。' : '正在读取 vLLM 部署日志…'}</div>`;
+  }
   return logs.map((entry) => `<div class="log-line ${entry.type}"><span>${esc(entry.time)}</span><span>${esc(entry.message)}</span></div>`).join('') + (rawLog ? `<pre class="remote-log">${esc(rawLog)}</pre>` : '');
 }
 function updateRuntime() {
@@ -139,19 +176,27 @@ function updateRuntime() {
   document.querySelector('#control-status').textContent = controlError || '本地客户端 · 部署状态由共享控制节点同步';
   const connection = document.querySelector('.connection-state');
   connection.classList.toggle('online', connected()); connection.innerHTML = `<i></i>${connected() ? '已连接' : '未连接'}`;
-  document.querySelector('[data-action="deploy"]').disabled = !connected() || busy || !!node().gpuError || !node().gpus.length;
+  document.querySelector('[data-action="deploy"]').disabled = !connected() || connecting || busy || directoryLoading || !!node().gpuError || !node().gpus.length || !!deployment(editingId)?.deletePending;
+  const stopButton = document.querySelector('[data-action="stop-selected"]');
+  stopButton.disabled = !deployment(selectedId) || deployment(selectedId).status === 'stopped' || deployment(selectedId).deletePending || busy;
+  const picker = document.querySelector('#log-service');
+  if (picker.innerHTML !== logOptions()) picker.innerHTML = logOptions();
+  picker.disabled = !state.deployments.length;
+  document.querySelector('.log-indicator').textContent = runtimeLogError ? '读取失败' : selectedId ? '每 3 秒同步' : '等待部署';
   const terminal = document.querySelector('.terminal');
   const nearBottom = terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 40;
   const content = terminalContent(); if (terminal.innerHTML !== content) { terminal.innerHTML = content; if (nearBottom) terminal.scrollTop = terminal.scrollHeight; }
-  document.querySelector('#available-models').innerHTML = node().models.map((m) => `<option value="${esc(m.path)}">${esc(m.alias)}</option>`).join('');
+  document.querySelector('.model-notice').innerHTML = renderModelIssue(directoryIssue);
 }
 async function pullState(full = false, snapshot = null) {
   const previousIds = state.nodes.map((n) => n.id).join(',');
   state = sharedState(snapshot || await api('/api/control/state')); controlError = '';
   if (!state.nodes.some((n) => n.id === machineId)) {
-    machineId = state.nodes[0]?.id || ''; connectedId = null; rootDraft = node().modelRoot; draft = newDraft(); full = true;
+    machineId = state.nodes[0]?.id || ''; connectedId = null; resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT; draft = newDraft(); full = true;
   }
   if (previousIds !== state.nodes.map((n) => n.id).join(',')) full = true;
+  const nextSelected = selectLogService({ nodes: state.nodes, services: state.deployments }, selectedId, machineId);
+  if (nextSelected !== selectedId) { selectedId = nextSelected; rawLog = ''; lastRawLog = ''; runtimeLogError = ''; logState = nextSelected ? 'loading' : 'idle'; }
   if (full) render(); else updateRuntime();
 }
 async function poll() {
@@ -159,11 +204,14 @@ async function poll() {
   polling = true;
   try {
     const id = selectedId;
-    const result = await readRuntime(api, id);
+    const target = machineId;
+    const result = await readRuntime(api, id, target || undefined);
+    const selectionUnchanged = selectedId === id && machineId === target;
     await pullState(false, result.snapshot);
-    if (selectedId === id) {
+    if (selectionUnchanged && selectedId === result.selectedId) {
       if (result.logs !== null && result.logs !== lastRawLog) { rawLog = result.logs; lastRawLog = result.logs; }
-      if (result.logError && !logs.some((l) => l.message === `日志读取失败：${result.logError}`)) log(`日志读取失败：${result.logError}`, 'muted');
+      runtimeLogError = result.logError ? `日志读取失败：${result.logError}` : '';
+      logState = result.logs !== null ? 'ready' : 'idle';
       updateRuntime();
     }
   } catch (cause) {
@@ -193,7 +241,7 @@ async function saveSettings(register = false) {
   try {
     if (register) await api('/api/control/nodes', { method: 'POST', body: { name: document.querySelector('#agent-name').value, url: document.querySelector('#agent-url').value, token: document.querySelector('#agent-token').value } });
     else await api('/api/local/settings', { method: 'PUT', body: { controllerUrl: document.querySelector('#controller-url').value, adminToken: document.querySelector('#admin-token').value } });
-    await pullState(true); rootDraft = node().modelRoot; draft = newDraft(); render();
+    await pullState(true); resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT; draft = newDraft(); render();
     document.querySelector(register ? '#agent-token' : '#admin-token').value = '';
     notify(register ? '机器已添加，选择后连接' : '已连接共享控制节点');
   } catch (cause) { if (dialogError.isConnected) dialogError.textContent = cause.message; }
@@ -201,23 +249,57 @@ async function saveSettings(register = false) {
 }
 
 function clearForm() {
-  editingId = null; selectedId = null; rawLog = ''; lastRawLog = ''; draft = newDraft(); error = ''; render();
+  editingId = null; draft = newDraft(); error = ''; render();
 }
 
-async function applyDirectory() {
-  const root = rootDraft.trim().replace(/\/+$/, '') || '/';
-  if (!root.startsWith('/')) { notify('模型目录需要使用绝对路径'); return; }
-  if (!demo) {
-    if (!connected()) { notify('请先连接机器'); return; }
-    await perform(async () => { const result = await api(`/api/control/nodes/${machineId}/model-root`, { method: 'PUT', body: { modelRoot: root } }); rootDraft = result.modelRoot; log(`模型目录已切换到 ${result.modelRoot}`); });
-    return;
+function resetDirectory() {
+  directoryReader.cancel(); directorySnapshot=null; directoryLoading=false; directoryIssue='';
+}
+function acceptDirectory(result, target, preserve=false) {
+  directorySnapshot={...result,nodeId:target}; rootDraft=result.path; draft.modelRoot=result.path;
+  if (!preserve || !draft.modelPath) draft.modelPath=result.children[0]?.path || '';
+  directoryIssue='';
+}
+async function loadDirectory(path,preserve=false) {
+  const target=machineId; directoryLoading=true; directoryIssue=''; rootDraft=path; render();
+  try {
+    const result=await directoryReader.read(target,path);
+    if (!result || target!==machineId) return;
+    acceptDirectory(result,target,preserve); directoryLoading=false; render();
+  } catch(cause) {
+    if (target!==machineId) return;
+    directoryLoading=false; directoryIssue=cause.message; directorySnapshot=null;
+    if (!preserve) draft.modelPath=''; render();
   }
-  const oldRoot = node().modelRoot;
-  node().modelRoot = root;
-  rootDraft = root;
-  node().models = node().models.map((model) => ({ ...model, path: `${root === '/' ? '' : root}/${model.alias}` }));
-  if (draft.modelPath.startsWith(oldRoot + '/')) draft.modelPath = (root === '/' ? '' : root) + draft.modelPath.slice(oldRoot.length);
-  save(); render(); notify('模型目录已保存（本地演示）');
+}
+function renderDirectoryPicker() {
+  if (!directoryPicker) return;
+  const picker=directoryPicker;
+  document.querySelector('#modal-root').innerHTML=`<div class="dialog-backdrop">${renderDirectoryDialog(picker.listing,{name:node().name,loading:picker.loading,error:picker.error,defaultPath:node().defaultModelRoot || DEFAULT_MODEL_ROOT})}</div>`;
+}
+async function navigateDirectory(path) {
+  const picker=directoryPicker; if(!picker) return;
+  const target=machineId; picker.loading=true; picker.error=''; picker.listing={...picker.listing,path,children:[]}; renderDirectoryPicker();
+  try {
+    const result=await directoryReader.read(target,path);
+    if (!result || directoryPicker!==picker || machineId!==target) return;
+    picker.listing=result; picker.loading=false; renderDirectoryPicker();
+  } catch(cause) {
+    if(directoryPicker!==picker || machineId!==target) return;
+    picker.loading=false; picker.error=cause.message; renderDirectoryPicker();
+  }
+  document.querySelector('[data-action="cancel-directory"]')?.focus();
+}
+async function browseDirectory() {
+  if(!connected() || busy || directoryLoading) return;
+  const storageRoot=node().modelBrowseRoot || '/data';
+  directoryPicker={listing:directorySnapshot || {root:storageRoot,path:rootDraft,parent:storageRoot,children:[]},loading:false,error:''};
+  await navigateDirectory(rootDraft);
+}
+function chooseDirectory() {
+  if(!directoryPicker || directoryPicker.loading || directoryPicker.error) return;
+  acceptDirectory(directoryPicker.listing,machineId);
+  closeDialog(); error=''; render(); document.querySelector('#model-path')?.focus();
 }
 
 function refreshMockTelemetry() {
@@ -239,7 +321,11 @@ async function connectMachine() {
     try {
       const result = await api(`/api/control/nodes/${target}/connect`, { method: 'POST', body: {} });
       state.nodes = state.nodes.map((n) => n.id === target ? result : n);
-      if (machineId === target) { connectedId = target; rootDraft = result.modelRoot; if (!draft.modelPath) draft.modelPath = result.models[0]?.path || ''; }
+      if (machineId === target) {
+        connectedId = target;
+        const selectedRoot=editingId ? rootDraft : result.defaultModelRoot || DEFAULT_MODEL_ROOT;
+        await loadDirectory(selectedRoot,!!editingId);
+      }
       log(`已连接 ${result.name} · ${result.gpus.length} 张 GPU`, 'success');
       if (result.gpuError) log(result.gpuError, 'muted');
       if (result.modelError) log(result.modelError, 'muted');
@@ -247,10 +333,11 @@ async function connectMachine() {
     finally { connecting = false; render(); }
     return;
   }
-  setTimeout(() => {
+  setTimeout(async () => {
     connecting = false;
     if (machineId !== target) { render(); return; }
     connectedId = target;
+    await loadDirectory(editingId ? rootDraft : DEFAULT_MODEL_ROOT,!!editingId);
     log(`演示连接成功 · ${node().gpus.length} 张 ${node().gpus[0].name.replace('NVIDIA ', '')}`, 'success');
     render();
   }, 650);
@@ -302,12 +389,13 @@ function editService(id) {
   if (!item) return;
   if (['starting', 'restarting'].includes(item.status)) { notify('服务正在启动，请稍后修改'); return; }
   machineId = item.nodeId;
-  rootDraft = node().modelRoot;
+  resetDirectory(); rootDraft = item.modelRoot || item.modelPath.slice(0,item.modelPath.lastIndexOf('/')) || '/';
   draft = structuredClone(item);
-  editingId = id; selectedId = id; rawLog = ''; lastRawLog = ''; error = '';
+  editingId = id; selectedId = id; rawLog = ''; lastRawLog = ''; runtimeLogError = ''; logState = 'loading'; activeView = 'deploy'; error = '';
   log(`载入 ${item.alias} 的部署配置。${connected() ? '修改后保存并重启。' : '请先连接对应机器。'}`, 'muted');
   render();
-  document.querySelector('.connection-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if(connected()) loadDirectory(rootDraft,true);
+  if (!demo) poll();
 }
 
 function requestStop(id) {
@@ -316,13 +404,45 @@ function requestStop(id) {
   document.querySelector('#modal-root').innerHTML = `<div class="dialog-backdrop"><section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="stop-title"><h2 id="stop-title">停止 ${esc(item.alias)}？</h2><p>停止后释放 GPU ${item.gpuIds.join(', ')}，部署配置会保留。</p><div><button class="button secondary" data-action="cancel-stop">取消</button><button class="button stop-button" data-confirm-stop="${id}">停止服务</button></div></section></div>`;
   document.querySelector('[data-action="cancel-stop"]').focus();
 }
-function closeDialog() { document.querySelector('#modal-root').innerHTML = ''; }
-async function copy(text) {
-  try { await navigator.clipboard.writeText(text); notify('已复制'); } catch { notify('复制不可用，请手动选择文本'); }
+function requestDelete(id) {
+  if (busy) return;
+  const html = renderDeleteDialog(deployment(id));
+  if (!html) { notify('只能删除已停止的服务，请先核对部署状态'); return; }
+  document.querySelector('#modal-root').innerHTML = `<div class="dialog-backdrop">${html}</div>`;
+  document.querySelector('[data-action="cancel-delete"]').focus();
+}
+
+async function confirmDelete(id) {
+  const item = deployment(id); closeDialog();
+  if (!renderDeleteDialog(item)) { notify('服务状态已变化，删除已取消'); return; }
+  let confirmed = demo;
+  if (!demo) {
+    const ok = await perform(async () => {
+      const result = await api(`/api/control/deployments/${id}`, { method: 'DELETE', body: {} });
+      if (result.id !== id || result.deleted !== true) throw new Error('后台未确认删除结果，请恢复连接后重试');
+      confirmed = true;
+    });
+    if (!ok && !confirmed && deployment(id)) { notify(error || '删除结果尚未确认，请恢复连接后重试'); return; }
+  } else { state = deleteDeployment(state, id); save(); }
+  if (confirmed || !deployment(id)) {
+    state.deployments = state.deployments.filter(candidate => candidate.id !== id);
+    if (selectedId === id) { selectedId = null; rawLog = ''; lastRawLog = ''; runtimeLogError = ''; logState = 'idle'; }
+    if (editingId === id) { editingId = null; draft = newDraft(); }
+    error = ''; log(`已删除部署 ${item.alias}，模型文件与日志保留。`, 'success');
+    render(); notify(`已删除 ${item.alias}`); if (!demo) poll();
+  }
+}
+function closeDialog() {
+  const wasDirectory=!!directoryPicker;
+  if(wasDirectory) { directoryReader.cancel(); directoryPicker=null; }
+  document.querySelector('#modal-root').innerHTML = '';
+  if(wasDirectory) document.querySelector('#model-root')?.focus();
+}
+async function copy(text,message='已复制') {
+  try { await navigator.clipboard.writeText(text); notify(message); } catch { notify('复制不可用，请手动选择文本'); }
 }
 
 document.addEventListener('input', (event) => {
-  if (event.target.id === 'model-root') rootDraft = event.target.value;
   const fields = { 'model-path': 'modelPath', 'service-alias': 'alias', 'gpu-memory': 'gpuMemoryUtilization' };
   if (fields[event.target.id]) { draft[fields[event.target.id]] = event.target.value; updatePreview(); }
 });
@@ -330,24 +450,38 @@ document.addEventListener('change', (event) => {
   const target = event.target;
   if (target.id === 'machine') {
     machineId = target.value; connectedId = null; editingId = null; selectedId = null; rawLog = ''; lastRawLog = '';
-    rootDraft = node().modelRoot;
+    runtimeLogError = ''; logState = 'idle';
+    closeDialog(); resetDirectory(); rootDraft = node().defaultModelRoot || DEFAULT_MODEL_ROOT;
     draft = newDraft(); error = '';
     logs = [{ time: 'READY', message: `已切换到 ${node().name}，等待连接。`, type: 'muted' }];
     render();
+    if (!demo) poll();
   }
+  if (target.id === 'log-service') selectService(target.value || null, 'logs');
+  if (target.id === 'model-path') { draft.modelPath=target.value; updatePreview(); }
   if (target.id === 'max-model-len') { draft.maxModelLen = Number(target.value); updatePreview(); }
   if (target.id === 'model-dtype') { draft.dtype = target.value; updatePreview(); }
 });
 document.addEventListener('click', async (event) => {
   const target = event.target.closest('button');
   if (!target || target.disabled) return;
+  if (target.dataset.copyAlias) {
+    const item=deployment(target.dataset.copyAlias);
+    if (item) await copy(item.alias,`已复制 model：${item.alias}`);
+    else notify('服务已移除，请刷新列表');
+    return;
+  }
+  if (target.dataset.browsePath!==undefined) { await navigateDirectory(target.dataset.browsePath); return; }
   if (target.dataset.gpu !== undefined) {
     const id = Number(target.dataset.gpu);
     draft.gpuIds = draft.gpuIds.includes(id) ? draft.gpuIds.filter((value) => value !== id) : [...draft.gpuIds, id].sort((a, b) => a - b);
     error = ''; render(); document.querySelector(`[data-gpu="${id}"]`)?.focus(); return;
   }
-  if (target.dataset.select) { selectedId = target.dataset.select; rawLog = ''; lastRawLog = ''; render(); if (!demo) poll(); return; }
+  if (target.dataset.view) { activeView = target.dataset.view; render(); return; }
+  if (target.dataset.select) { selectService(target.dataset.select, 'logs'); return; }
   if (target.dataset.edit) { editService(target.dataset.edit); return; }
+  if (target.dataset.delete) { requestDelete(target.dataset.delete); return; }
+  if (target.dataset.confirmDelete) { await confirmDelete(target.dataset.confirmDelete); return; }
   if (target.dataset.stop) { requestStop(target.dataset.stop); return; }
   if (target.dataset.confirmStop) {
     const item = deployment(target.dataset.confirmStop);
@@ -379,7 +513,9 @@ document.addEventListener('click', async (event) => {
     case 'save-settings': await saveSettings(); break;
     case 'register-node': await saveSettings(true); break;
     case 'close-settings': closeDialog(); break;
-    case 'apply-directory': applyDirectory(); break;
+    case 'browse-directory': await browseDirectory(); break;
+    case 'choose-directory': chooseDirectory(); break;
+    case 'cancel-directory': closeDialog(); break;
     case 'connect': connectMachine(); break;
     case 'deploy': deploy(); break;
     case 'clear-form': clearForm(); break;
@@ -388,12 +524,13 @@ document.addEventListener('click', async (event) => {
     case 'copy-command': if (!draft.alias.trim() || !draft.gpuIds.length) { notify('请填写服务别名并选择 GPU'); break; } await copy(buildCommand(draft)); break;
     case 'copy-api': await copy(state.gateway.baseUrl); break;
     case 'clear-log': logs = []; rawLog = ''; render(); break;
+    case 'refresh-log': lastRawLog = ''; runtimeLogError = ''; logState = 'loading'; render(); if (!demo) await poll(); break;
     case 'stop-selected': requestStop(selectedId); break;
     case 'cancel-stop': closeDialog(); break;
+    case 'cancel-delete': closeDialog(); break;
   }
 });
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && event.target.id === 'model-root') { event.preventDefault(); applyDirectory(); return; }
   const dialog = document.querySelector('.confirm-dialog');
   if (!dialog) return;
   if (event.key === 'Escape') closeDialog();
@@ -407,6 +544,6 @@ document.addEventListener('keydown', (event) => {
 render();
 if (demo) { for (const item of state.deployments) if (['starting', 'restarting'].includes(item.status)) completeDeployment(item.id); }
 else {
-  pullState(true).catch((cause) => { controlError = cause.message; error = cause.message; render(); });
+  pullState(true).then(() => poll()).catch((cause) => { controlError = cause.message; error = cause.message; render(); });
   setInterval(poll, 3000);
 }
